@@ -45,6 +45,8 @@ export function RunBar({ className }: { className?: string }) {
       : null;
     if (!current || current.status !== "queued") return;
 
+    useReportStore.getState().openMonitorTab();
+
     mockCleanupRef.current?.();
 
     const id = current.id;

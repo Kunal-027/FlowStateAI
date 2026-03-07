@@ -52,6 +52,8 @@ export function ResizableRunnerLayout({ children }: { children: React.ReactNode 
   const restoredRef = useRef(false);
   const shouldOpenReportsTab = useReportStore((s) => s.shouldOpenReportsTab);
   const clearShouldOpenReportsTab = useReportStore((s) => s.clearShouldOpenReportsTab);
+  const shouldOpenMonitorTab = useReportStore((s) => s.shouldOpenMonitorTab);
+  const clearShouldOpenMonitorTab = useReportStore((s) => s.clearShouldOpenMonitorTab);
 
   useEffect(() => {
     setSidebarWidth(readStored(STORAGE_KEY_SIDEBAR, DEFAULT_SIDEBAR, MIN_SIDEBAR, MAX_SIDEBAR));
@@ -65,6 +67,14 @@ export function ResizableRunnerLayout({ children }: { children: React.ReactNode 
       clearShouldOpenReportsTab();
     }
   }, [shouldOpenReportsTab, clearShouldOpenReportsTab]);
+
+  /** When user clicks Run, switch to Monitor tab so they see the browser/console. */
+  useEffect(() => {
+    if (shouldOpenMonitorTab) {
+      setMainTab("monitor");
+      clearShouldOpenMonitorTab();
+    }
+  }, [shouldOpenMonitorTab, clearShouldOpenMonitorTab]);
 
   /** Restore test cases from localStorage or seed with mocks when the list is empty (so tests don’t “disappear” on refresh). */
   useEffect(() => {

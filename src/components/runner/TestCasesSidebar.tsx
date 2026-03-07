@@ -382,6 +382,8 @@ export function TestCasesSidebar({ className }: { className?: string }) {
     const tc = store.testCases.find((t) => t.id === id);
     if (!tc || tc.status === "running") return;
 
+    useReportStore.getState().openMonitorTab();
+
     mockCleanupRef.current?.();
     setPaused(false);
     pausedRef.current = false;

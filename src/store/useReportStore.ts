@@ -64,12 +64,17 @@ export interface ReportState {
   selectedReportId: string | null;
   /** When true, UI should switch to Reports tab and then clear this (e.g. after run completes). */
   shouldOpenReportsTab: boolean;
+  /** When true, UI should switch to Monitor tab and then clear this (e.g. when user clicks Run). */
+  shouldOpenMonitorTab: boolean;
 }
 
 export interface ReportActions {
   addReport: (report: RunReport) => void;
   setSelectedReportId: (id: string | null) => void;
   clearShouldOpenReportsTab: () => void;
+  /** Set flag so layout switches to Monitor tab (call when starting a run). */
+  openMonitorTab: () => void;
+  clearShouldOpenMonitorTab: () => void;
   clearReports: () => void;
   getReportById: (id: string) => RunReport | undefined;
   /** Load reports from localStorage (call once after mount on client). */
@@ -81,6 +86,7 @@ const initialState: ReportState = {
   reports: [],
   selectedReportId: null,
   shouldOpenReportsTab: false,
+  shouldOpenMonitorTab: false,
 };
 
 export const useReportStore = create<ReportState & ReportActions>((set, get) => ({
@@ -101,9 +107,12 @@ export const useReportStore = create<ReportState & ReportActions>((set, get) => 
 
   clearShouldOpenReportsTab: () => set({ shouldOpenReportsTab: false }),
 
+  openMonitorTab: () => set({ shouldOpenMonitorTab: true }),
+  clearShouldOpenMonitorTab: () => set({ shouldOpenMonitorTab: false }),
+
   clearReports: () => {
     saveReports([]);
-    set({ reports: [], selectedReportId: null, shouldOpenReportsTab: false });
+    set({ reports: [], selectedReportId: null, shouldOpenReportsTab: false, shouldOpenMonitorTab: false });
   },
 
   getReportById: (id) => get().reports.find((r) => r.id === id),
