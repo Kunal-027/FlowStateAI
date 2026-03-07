@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import Link from "next/link";
 import { RunnerToolbar } from "@/components/runner/RunnerToolbar";
 
-/** Runner main content: browser selector, add test case form, Home link, and hint. */
+/** Runner page is client-only; layout uses force-dynamic so this segment is never statically built. */
 export default function RunnerPage() {
   return (
     <div className="flex flex-col gap-4 border-t border-border pt-3">

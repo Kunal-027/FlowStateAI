@@ -10,8 +10,10 @@
     "bridge": "node bridge/server.js",
     "bridge:watch": "nodemon --watch bridge --ext js bridge/server.js",
     "dev:all": "concurrently \"npm run dev\" \"npm run bridge:watch\"",
-    "kill-ports": "node scripts/kill-ports.js",
+    "kill-ports": "node scripts/kill-ports.js 3001 4001",
     "clean": "node scripts/clean-next.js",
+    "clean:trace": "node scripts/clean-trace.js",
+    "dev:fresh": "node scripts/kill-ports.js 3001 4001 && node scripts/clean-next.js && npm run dev:all",
     "fresh": "node scripts/kill-ports.js 3000 4000 && node scripts/clean-next.js && next dev -p 3000"
   },
   "dependencies": {

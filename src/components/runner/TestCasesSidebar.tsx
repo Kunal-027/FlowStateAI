@@ -9,6 +9,7 @@ import { saveTestCasesToStorage, loadTestCasesFromBackup, hasTestCasesBackup } f
 import { getMockTestCases } from "@/lib/mockTestCases";
 import { startMockExecution } from "@/services/mock";
 import { parseSingleInstruction } from "@/lib/parser";
+import { useReportStore, buildReportFromTestCase } from "@/store/useReportStore";
 import type { TestCase, TestStep } from "@/types/execution";
 import { Play, Loader2, ChevronDown, ChevronRight, Plus, Trash2, Save, Square, Pause, PlayCircle, Pencil } from "lucide-react";
 
@@ -410,6 +411,12 @@ export function TestCasesSidebar({ className }: { className?: string }) {
       getStepDelayMs: () => getExecutionState().stepDelayMs,
       getWaitIfPaused,
       steps,
+      onRunComplete: (testCaseId) => {
+        const tc = getExecutionState().testCases.find((c) => c.id === testCaseId);
+        if (tc && (tc.status === "success" || tc.status === "failed")) {
+          useReportStore.getState().addReport(buildReportFromTestCase(tc));
+        }
+      },
     };
 
     mockCleanupRef.current = startMockExecution(id, actions, opts);

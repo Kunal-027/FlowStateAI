@@ -38,6 +38,8 @@ export interface TestStep {
   order: number;
   /** Last error message if failed */
   error?: string;
+  /** Base64 screenshot when step failed (e.g. from bridge ambiguity_error). */
+  screenshot?: string;
   /** Self-healing attempts made for this step */
   healingAttempts: number;
   /** Retry count (for exponential backoff) */
@@ -100,4 +102,34 @@ export interface StreamFrame {
   width: number;
   height: number;
   timestamp: number;
+}
+
+// ─── Run report (for Reports tab & HTML export) ──────────────────────────────
+/** Single step entry in a run report (snapshot at completion). */
+export interface ReportStep {
+  stepId: string;
+  order: number;
+  instruction: string;
+  status: StepStatus;
+  /** Error message when status is failed. */
+  error?: string;
+  /** Base64 screenshot when step failed. */
+  screenshot?: string;
+  /** True if self-healing was used for this step (show purple badge). */
+  selfHealed: boolean;
+  startedAt?: string;
+  completedAt?: string;
+}
+
+/** One completed run report (persisted for Reports tab and export). */
+export interface RunReport {
+  id: string;
+  testCaseId: string;
+  testCaseName: string;
+  status: TestCaseStatus;
+  startedAt: string;
+  completedAt: string;
+  /** Aggregate error when status is failed. */
+  error?: string;
+  steps: ReportStep[];
 }

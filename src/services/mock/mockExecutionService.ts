@@ -1,5 +1,4 @@
-import type { LogEntry } from "@/types/execution";
-import type { TestStep, PlaywrightStepPayload } from "@/types/execution";
+import type { LogEntry, TestStep, PlaywrightStepPayload } from "@/types/execution";
 
 /** Actions required by the mock execution service to update store (logs, test case status, active step). */
 export interface MockExecutionActions {
@@ -7,8 +6,8 @@ export interface MockExecutionActions {
   updateTestCase: (id: string, updates: { status: string; completedAt?: string; error?: string }) => void;
   /** Set the currently running step id (null when idle or between steps). Used to sync sidebar and monitor. */
   setActiveStep?: (id: string | null) => void;
-  /** Update a step's status (e.g. running, success, failed). */
-  updateStep?: (testCaseId: string, stepId: string, updates: Partial<{ status: string }>) => void;
+  /** Update a step's status (and optional error/screenshot for reporting). */
+  updateStep?: (testCaseId: string, stepId: string, updates: Partial<Pick<TestStep, "status" | "error" | "screenshot">>) => void;
 }
 
 /** Result of executing a step via the bridge (step_done / error / ambiguity_error). */
@@ -102,6 +101,8 @@ export interface MockExecutionOptions {
   getStepDelayMs?: () => number;
   /** If provided, awaited before each step; use to implement Pause (return pending promise when paused). */
   getWaitIfPaused?: () => Promise<void>;
+  /** Called when a run finishes (success or failed). Use to persist a report from the store. */
+  onRunComplete?: (testCaseId: string) => void;
   steps?: TestStep[];
 }
 
@@ -125,6 +126,7 @@ export function startMockExecution(
   const getSessionId = options?.getSessionId;
   const getStepDelayMs = options?.getStepDelayMs;
   const getWaitIfPaused = options?.getWaitIfPaused;
+  const onRunComplete = options?.onRunComplete;
   const steps = options?.steps ?? [];
 
   /** Sends test_finished or test_failed to the bridge when a run completes, if bridge is connected. */
@@ -167,10 +169,15 @@ export function startMockExecution(
           const stepMsg = { ...toStepMessage(step), instruction: step.instruction };
           try {
             const result = await executeStep(stepMsg);
-            updateStep?.(testCaseId, step.id, { status: result.success ? "success" : "failed" });
+            updateStep?.(testCaseId, step.id, {
+              status: result.success ? "success" : "failed",
+              ...(result.success ? {} : { error: result.error }),
+              screenshot: result.screenshot,
+            });
             if (!result.success) {
               actions.updateTestCase(testCaseId, { status: "failed", error: result.error, completedAt: new Date().toISOString() });
               setActiveStep?.(null);
+              onRunComplete?.(testCaseId);
               notifyTestEnd(false);
               return;
             }
@@ -183,10 +190,16 @@ export function startMockExecution(
               if (cancelled) return;
             }
           } catch (err) {
-            const message = err && typeof err === "object" && "error" in err ? String((err as StepResult).error) : String(err);
-            updateStep?.(testCaseId, step.id, { status: "failed" });
+            const res = err && typeof err === "object" && "error" in err ? (err as StepResult) : null;
+            const message = res ? String(res.error) : String(err);
+            updateStep?.(testCaseId, step.id, {
+              status: "failed",
+              error: message,
+              ...(res?.screenshot ? { screenshot: res.screenshot } : {}),
+            });
             actions.updateTestCase(testCaseId, { status: "failed", error: message, completedAt: new Date().toISOString() });
             setActiveStep?.(null);
+            onRunComplete?.(testCaseId);
             notifyTestEnd(false);
             return;
           }
@@ -196,6 +209,7 @@ export function startMockExecution(
         if (cancelled) return;
         setActiveStep?.(null);
         actions.updateTestCase(testCaseId, { status: "success", completedAt: new Date().toISOString() });
+        onRunComplete?.(testCaseId);
         notifyTestEnd(true);
         actions.addLog({ level: "info", message: `All ${sortedSteps.length} step(s) completed successfully.`, testCaseId });
         return;
@@ -211,6 +225,7 @@ export function startMockExecution(
       });
       mockTimeout = setTimeout(() => {
         actions.updateTestCase(testCaseId, { status: "success", completedAt: new Date().toISOString() });
+        onRunComplete?.(testCaseId);
         notifyTestEnd(true);
       }, 1500);
     } else {
@@ -221,6 +236,7 @@ export function startMockExecution(
       });
       mockTimeout = setTimeout(() => {
         actions.updateTestCase(testCaseId, { status: "success", completedAt: new Date().toISOString() });
+        onRunComplete?.(testCaseId);
         notifyTestEnd(true);
       }, 1500);
     }

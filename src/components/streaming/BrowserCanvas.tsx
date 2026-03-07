@@ -138,6 +138,7 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
           data?: string;
           message?: string;
           target?: string;
+          /** Base64 screenshot for this step (included with step_done for reports). */
           screenshot?: string;
           sessionId?: string;
           /** From bridge step_done: true = step passed, false = e.g. verify_displayed failed */
@@ -171,12 +172,14 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
         // Step finished: respect bridge's success flag so verify failures fail the run (no false "all passed")
         if (parsed.type === "step_done") {
           const success = parsed.success !== false;
+          const screenshot = parsed.screenshot ?? undefined;
           if (success) {
-            pendingStepRef.current?.resolve({ success: true });
+            pendingStepRef.current?.resolve({ success: true, screenshot });
           } else {
             pendingStepRef.current?.reject({
               success: false,
               error: parsed.message ?? "Step failed",
+              screenshot,
             });
             pendingStepRef.current = null;
           }

@@ -2,6 +2,7 @@
 
 import { useRef, useEffect } from "react";
 import { useExecutionStore, getExecutionState } from "@/store/useExecutionStore";
+import { useReportStore, buildReportFromTestCase } from "@/store/useReportStore";
 import { startMockExecution } from "@/services/mock";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -57,6 +58,8 @@ export function RunBar({ className }: { className?: string }) {
       {
         addLog: (entry) => store.addLog(entry),
         updateTestCase: (tid, updates) => store.updateTestCase(tid, updates),
+        setActiveStep: store.setActiveStep,
+        updateStep: store.updateStep,
       },
       {
         getBridgeSend: () => getExecutionState().bridgeSend,
@@ -64,6 +67,12 @@ export function RunBar({ className }: { className?: string }) {
         getSessionId: () => getExecutionState().streamSessionId,
         getStepDelayMs: () => getExecutionState().stepDelayMs,
         steps,
+        onRunComplete: (testCaseId) => {
+          const tc = getExecutionState().testCases.find((c) => c.id === testCaseId);
+          if (tc && (tc.status === "success" || tc.status === "failed")) {
+            useReportStore.getState().addReport(buildReportFromTestCase(tc));
+          }
+        },
       }
     );
   };

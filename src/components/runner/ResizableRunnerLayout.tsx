@@ -5,10 +5,13 @@ import { TestCasesSidebar } from "@/components/runner/TestCasesSidebar";
 import { RunBar } from "@/components/runner/RunBar";
 import { MonitorPanel } from "@/components/runner/MonitorPanel";
 import { ConsoleOverlay } from "@/components/runner/ConsoleOverlay";
+import { ReportsPanel } from "@/components/runner/ReportsPanel";
 import { PanelResizer } from "@/components/runner/PanelResizer";
 import { loadTestCasesFromStorage, loadTestCasesFromBackup } from "@/lib/testCasePersistence";
 import { getMockTestCases } from "@/lib/mockTestCases";
 import { useExecutionStore } from "@/store/useExecutionStore";
+import { useReportStore } from "@/store/useReportStore";
+import { cn } from "@/lib/utils";
 
 const STORAGE_KEY_SIDEBAR = "flowstate-runner-sidebar-width";
 const STORAGE_KEY_CONSOLE = "flowstate-runner-console-width";
@@ -39,16 +42,29 @@ function writeStored(key: string, value: number) {
   }
 }
 
+type MainTab = "monitor" | "reports";
+
 export function ResizableRunnerLayout({ children }: { children: React.ReactNode }) {
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR);
   const [consoleWidth, setConsoleWidth] = useState(DEFAULT_CONSOLE);
+  const [mainTab, setMainTab] = useState<MainTab>("monitor");
   const setTestCases = useExecutionStore((s) => s.setTestCases);
   const restoredRef = useRef(false);
+  const shouldOpenReportsTab = useReportStore((s) => s.shouldOpenReportsTab);
+  const clearShouldOpenReportsTab = useReportStore((s) => s.clearShouldOpenReportsTab);
 
   useEffect(() => {
     setSidebarWidth(readStored(STORAGE_KEY_SIDEBAR, DEFAULT_SIDEBAR, MIN_SIDEBAR, MAX_SIDEBAR));
     setConsoleWidth(readStored(STORAGE_KEY_CONSOLE, DEFAULT_CONSOLE, MIN_CONSOLE, MAX_CONSOLE));
   }, []);
+
+  /** When a run completes, switch to Reports tab and show the new report. */
+  useEffect(() => {
+    if (shouldOpenReportsTab) {
+      setMainTab("reports");
+      clearShouldOpenReportsTab();
+    }
+  }, [shouldOpenReportsTab, clearShouldOpenReportsTab]);
 
   /** Restore test cases from localStorage or seed with mocks when the list is empty (so tests don’t “disappear” on refresh). */
   useEffect(() => {
@@ -95,18 +111,51 @@ export function ResizableRunnerLayout({ children }: { children: React.ReactNode 
       <main className="flex flex-1 flex-col min-h-0 overflow-hidden p-4 gap-3 min-w-0">
         <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-hidden">
           <RunBar />
-          <div className="flex-1 min-h-0 flex flex-row gap-0 overflow-hidden">
-            <div
-              className="shrink-0 flex flex-col overflow-hidden min-h-0"
-              style={{ width: consoleWidth, minWidth: MIN_CONSOLE, maxWidth: MAX_CONSOLE }}
+          <div className="shrink-0 flex gap-0 border-b border-border">
+            <button
+              type="button"
+              onClick={() => setMainTab("monitor")}
+              className={cn(
+                "px-3 py-2 text-sm font-medium rounded-t-md transition-colors",
+                mainTab === "monitor"
+                  ? "bg-background text-foreground border border-border border-b-0 -mb-px"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
             >
-              <ConsoleOverlay className="flex-1 min-w-0 w-full" />
-            </div>
-            <PanelResizer direction="vertical" onDrag={handleConsoleDrag} />
-            <div className="flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden basis-0">
-              <MonitorPanel />
-            </div>
+              Monitor
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainTab("reports")}
+              className={cn(
+                "px-3 py-2 text-sm font-medium rounded-t-md transition-colors",
+                mainTab === "reports"
+                  ? "bg-background text-foreground border border-border border-b-0 -mb-px"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              Reports
+            </button>
           </div>
+          {mainTab === "monitor" && (
+            <div className="flex-1 min-h-0 flex flex-row gap-0 overflow-hidden">
+              <div
+                className="shrink-0 flex flex-col overflow-hidden min-h-0"
+                style={{ width: consoleWidth, minWidth: MIN_CONSOLE, maxWidth: MAX_CONSOLE }}
+              >
+                <ConsoleOverlay className="flex-1 min-w-0 w-full" />
+              </div>
+              <PanelResizer direction="vertical" onDrag={handleConsoleDrag} />
+              <div className="flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden basis-0">
+                <MonitorPanel />
+              </div>
+            </div>
+          )}
+          {mainTab === "reports" && (
+            <div className="flex-1 min-h-0 min-w-0 overflow-hidden">
+              <ReportsPanel className="h-full" />
+            </div>
+          )}
         </div>
         {children}
       </main>

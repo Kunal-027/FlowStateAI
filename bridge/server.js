@@ -353,6 +353,21 @@ function send(ws, type, payload = {}) {
 }
 
 /**
+ * Takes a PNG screenshot of the page for report attachment. Returns base64 string or null.
+ * @param {import('playwright').Page | null} page - Playwright page.
+ * @returns {Promise<string | null>}
+ */
+async function takeStepScreenshot(page) {
+  if (!page) return null;
+  try {
+    const buf = await page.screenshot({ type: "png" });
+    return buf.toString("base64");
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
  * Sends a log event so the frontend console shows bridge-driven output only (no mock logs).
  * @param {WebSocket} ws - The client WebSocket.
  * @param {string} message - Log line (e.g. "Starting step: click \"Submit\"…", "Navigation complete.").
@@ -544,8 +559,8 @@ function processStepQueue(ws) {
         const visible = await isElementWithTextVisible(activePage, verifyTarget, { timeout: 8000 });
         const verifyMsg = visible ? "Step successful." : `"${verifyTarget}" is not displayed.`;
         sendLog(ws, verifyMsg, visible ? "info" : "error", sessionId);
-        // Include message on failure so the UI can show it as the test error (e.g. in test case status)
-        send(ws, "step_done", { success: visible, sessionId, message: visible ? undefined : verifyMsg });
+        const stepScreenshot = await takeStepScreenshot(activePage);
+        send(ws, "step_done", { success: visible, sessionId, message: visible ? undefined : verifyMsg, screenshot: stepScreenshot });
         done = true;
       }
 
@@ -718,8 +733,9 @@ function processStepQueue(ws) {
               await activePage.press(selector, msg.key || "Enter");
             }
             lastError = null;
+            const stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
-            send(ws, "step_done", { success: true, sessionId });
+            send(ws, "step_done", { success: true, sessionId, screenshot: stepScreenshot });
             done = true;
             break;
           } catch (e) {
@@ -733,7 +749,7 @@ function processStepQueue(ws) {
             screenshotBase64 = buf.toString("base64");
           } catch (_) {}
           sendLog(ws, `Step failed: ${lastError.message}`, "error", sessionId);
-          send(ws, "step_done", { success: false, sessionId });
+          send(ws, "step_done", { success: false, sessionId, screenshot: screenshotBase64 });
           const errTarget = resolvedTarget ?? target;
           send(ws, "ambiguity_error", {
             sessionId,
@@ -745,31 +761,38 @@ function processStepQueue(ws) {
         }
       } else if (selector || action === "navigate" || action === "wait") {
         try {
+          let stepScreenshot = null;
           if (action === "click" && selector) {
             await clickWithVisibleOrForce(activePage, selector);
+            stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
-            send(ws, "step_done", { success: true, sessionId });
+            send(ws, "step_done", { success: true, sessionId, screenshot: stepScreenshot });
           } else if ((action === "type" || action === "fill") && selector) {
             await fillWithVisibleWait(activePage, selector, msg.text ?? msg.value ?? "");
+            stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
-            send(ws, "step_done", { success: true, sessionId });
+            send(ws, "step_done", { success: true, sessionId, screenshot: stepScreenshot });
           } else if (action === "navigate" && msg.url) {
             await gotoWithAbortHandling(activePage, msg.url, { waitUntil: "domcontentloaded", timeout: 60000 });
+            stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
-            send(ws, "step_done", { success: true, sessionId });
+            send(ws, "step_done", { success: true, sessionId, screenshot: stepScreenshot });
           } else if (action === "press" && selector) {
             await highlightElement(activePage, selector);
             await activePage.press(selector, msg.key || "Enter");
+            stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
-            send(ws, "step_done", { success: true, sessionId });
+            send(ws, "step_done", { success: true, sessionId, screenshot: stepScreenshot });
           } else if (action === "wait") {
             const ms = typeof msg.value === "number" ? msg.value : 1000;
             await new Promise((r) => setTimeout(r, ms));
+            stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
-            send(ws, "step_done", { success: true, sessionId });
+            send(ws, "step_done", { success: true, sessionId, screenshot: stepScreenshot });
           } else {
+            stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
-            send(ws, "step_done", { success: true, sessionId });
+            send(ws, "step_done", { success: true, sessionId, screenshot: stepScreenshot });
           }
           done = true;
         } catch (e) {
@@ -779,13 +802,14 @@ function processStepQueue(ws) {
             screenshotBase64 = buf.toString("base64");
           } catch (_) {}
           sendLog(ws, `Step failed: ${e.message}`, "error", sessionId);
-          send(ws, "step_done", { success: false, sessionId });
+          send(ws, "step_done", { success: false, sessionId, screenshot: screenshotBase64 });
           send(ws, "error", { sessionId, message: e.message });
           send(ws, "test_error", { sessionId, message: e.message, screenshot: screenshotBase64 });
         }
       } else if (!done) {
+        const stepScreenshot = await takeStepScreenshot(activePage);
         sendLog(ws, "Step successful.", "info", sessionId);
-        send(ws, "step_done", { success: true, sessionId });
+        send(ws, "step_done", { success: true, sessionId, screenshot: stepScreenshot });
       }
     } catch (err) {
       let screenshotBase64 = null;
@@ -794,7 +818,7 @@ function processStepQueue(ws) {
         screenshotBase64 = buf.toString("base64");
       } catch (_) {}
       sendLog(ws, `Step failed: ${err.message}`, "error", sessionId);
-      send(ws, "step_done", { success: false, sessionId });
+      send(ws, "step_done", { success: false, sessionId, screenshot: screenshotBase64 });
       send(ws, "test_error", { sessionId, message: err.message, screenshot: screenshotBase64 });
     } finally {
       state.processing = false;
