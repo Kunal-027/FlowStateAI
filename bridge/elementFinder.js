@@ -57,37 +57,47 @@ function fieldScore(fieldValue, query) {
 }
 
 /**
- * For fill/type, query aliases so "username" matches "email", "login", etc.
- * @param {string} query - Original query.
- * @param {string} [action] - "fill" | "type" or other.
- * @returns {string[]} List of query and aliases to score against.
+ * Global aliases: minimal set of common terms so any app works without site-specific config.
+ * Used only to expand variants; primary matching is by query + words (see below).
+ */
+const GLOBAL_FILL_ALIASES = {
+  username: ["email", "login", "user", "phone"],
+  email: ["username", "login", "user"],
+  password: ["pass", "pwd"],
+  search: ["q", "query", "search box"],
+};
+const GLOBAL_CLICK_ALIASES = {
+  login: ["sign in", "log in", "submit", "signin"],
+  submit: ["login", "sign in", "log in"],
+  go: ["submit", "search button"],
+};
+
+/**
+ * Returns variants for fuzzy matching: query, its words, and optional global aliases.
+ * Dynamic: "search gym" → ["search gym", "search", "gym"] so any "Search gym" placeholder matches
+ * without hardcoding site-specific phrases. Supports millions of user phrasings.
+ * @param {string} query - Original query (e.g. "search gym", "admin panel").
+ * @param {string} [action] - "fill" | "type" | "click" | "hover" for alias expansion.
+ * @returns {string[]} List of query and variants to score against.
  */
 function getQueryVariants(query, action) {
   const q = normalize(query);
   if (!q) return [];
-  const fillAliases = {
-    username: ["email", "login", "user", "phone", "email or phone"],
-    email: ["username", "login", "user", "email or phone"],
-    password: ["pass", "pwd"],
-    search: ["q", "query", "google search", "search box"],
-  };
-  const clickAliases = {
-    login: ["sign in", "log in", "submit", "signin", "login button"],
-    submit: ["login", "sign in", "log in", "submit form"],
-  };
-  const list = [q];
+  const words = toWords(query).filter((w) => w.length > 1);
+  const list = [q, ...words];
+
   if (action === "fill" || action === "type") {
-    for (const [key, vals] of Object.entries(fillAliases)) {
-      if (key === q || vals.includes(q)) {
-        list.push(q, key, ...vals);
+    for (const [key, vals] of Object.entries(GLOBAL_FILL_ALIASES)) {
+      if (key === q || vals.includes(q) || words.includes(key)) {
+        list.push(key, ...vals);
         break;
       }
     }
   }
   if (action === "click" || action === "hover") {
-    for (const [key, vals] of Object.entries(clickAliases)) {
-      if (key === q || vals.includes(q)) {
-        list.push(q, key, ...vals);
+    for (const [key, vals] of Object.entries(GLOBAL_CLICK_ALIASES)) {
+      if (key === q || vals.includes(q) || words.includes(key)) {
+        list.push(key, ...vals);
         break;
       }
     }
@@ -214,7 +224,7 @@ function findBestSelector(snapshot, query, action) {
     const nq = normalize(query);
     const qWords = nq.split(/\s+/).filter(Boolean);
     if (qWords.length >= 2) {
-      // Require full phrase in text/ariaLabel so "Admin Control Panel" doesn't match "Super Admin"
+      // Prefer full phrase in text/ariaLabel (e.g. "Admin Control Panel"); if none, use best variant match (e.g. "Search Button" -> "Go")
       const phraseCandidates = candidates.filter((c) => {
         const entry = snapshot.find((e) => e.selector === c.selector);
         const text = normalize((entry && (entry.text || entry.ariaLabel)) || "");
@@ -222,9 +232,8 @@ function findBestSelector(snapshot, query, action) {
       });
       if (phraseCandidates.length > 0) {
         candidates = phraseCandidates;
-      } else {
-        return null;
       }
+      // else: keep candidates (scored via aliases, e.g. "Search Button" matches "Go" button)
       candidates = [...candidates].sort((a, b) => {
         const entryA = snapshot.find((e) => e.selector === a.selector);
         const entryB = snapshot.find((e) => e.selector === b.selector);

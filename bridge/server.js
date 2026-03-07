@@ -1,6 +1,7 @@
 /* eslint-disable */
+require("dotenv").config({ path: require("path").resolve(__dirname, "..", ".env") });
 /**
- * Bridge server: Express + WebSocket on port 4000.
+ * Bridge server: Express + WebSocket on port 4001.
  * Browser is launched once at server startup. Each new client gets a new page in that browser.
  * Closing a client only closes that client's page, not the browser.
  * - On 'RUN_TEST': creates a new page (tab), starts screenshot loop (100ms), emits 'frame' (base64).
@@ -13,67 +14,9 @@ const { WebSocketServer } = require("ws");
 const { chromium } = require("playwright");
 const { findBestSelector } = require("./elementFinder");
 const { getAiAction } = require("./aiInterpreter");
+const { parseInstructionDynamically } = require("./instructionParser");
 
-/**
- * Dynamically parses a raw step instruction into action/target/value using generic patterns.
- * Used when AI is unavailable so any phrasing (e.g. "Enter X in Y field", "Type X in the email box") works.
- * @param {string} instruction - Raw instruction text.
- * @returns {{ action: string, target?: string, value?: string } | null}
- */
-function parseInstructionDynamically(instruction) {
-  if (!instruction || typeof instruction !== "string") return null;
-  const s = instruction.trim();
-  const lower = s.toLowerCase();
-  if (!s) return null;
-
-  const fillInMatch = s.match(/^(?:enter|type|put)\s+(.+?)\s+in\s+(?:the\s+)?(.+?)(?:\s+field)?\s*$/i);
-  if (fillInMatch) {
-    return { action: "fill", value: fillInMatch[1].trim(), target: fillInMatch[2].trim().replace(/\s+field$/i, "").trim() || fillInMatch[2].trim() };
-  }
-  const fillQuotedMatch = s.match(/^(?:enter|type)\s+(.+?)\s+"([^"]+)"\s*$/i);
-  if (fillQuotedMatch) {
-    return { action: "fill", target: fillQuotedMatch[1].trim(), value: fillQuotedMatch[2].trim() };
-  }
-  const fillDashMatch = s.match(/^(?:enter|type)\s+(.+?)\s+-\s+(.+)$/i);
-  if (fillDashMatch) {
-    return { action: "fill", target: fillDashMatch[1].trim(), value: fillDashMatch[2].trim() };
-  }
-  if (/^(?:enter|type)\s+\w+/i.test(s)) {
-    const fallbackFill = s.match(/^(?:enter|type)\s+(\w+)\s+(.+)$/i);
-    if (fallbackFill) {
-      const value = fallbackFill[2].trim().replace(/^["']|["']$/g, "").replace(/\\/g, "");
-      return { action: "fill", target: fallbackFill[1].trim(), value };
-    }
-  }
-  const fillWithMatch = s.match(/^fill\s+(.+?)\s+with\s+(.+)$/i);
-  if (fillWithMatch) {
-    return { action: "fill", target: fillWithMatch[1].trim(), value: fillWithMatch[2].trim() };
-  }
-  if (lower.startsWith("click ")) {
-    const afterClick = s.replace(/^click\s+/i, "").trim();
-    const onQuoted = afterClick.match(/^on\s+["'](.+?)["']\s*$/);
-    if (onQuoted) return { action: "click", target: onQuoted[1].trim() };
-    const onWord = afterClick.match(/^on\s+(.+)$/);
-    if (onWord) return { action: "click", target: onWord[1].trim() };
-    return { action: "click", target: afterClick };
-  }
-  if (lower.startsWith("hover ")) {
-    return { action: "hover", target: s.replace(/^hover\s+/i, "").trim() };
-  }
-  if (lower.startsWith("navigate ") || lower.startsWith("go to ")) {
-    const url = s.replace(/^(?:navigate|go to)\s+/i, "").trim();
-    return { action: "navigate", target: url, value: url };
-  }
-  const verifyQuoted = s.match(/^\s*(?:verify|check|assert|ensure|see)\s+(?:that\s+)?['"](.+?)['"]\s+is\s+(?:displayed|visible|shown)\s*$/i);
-  if (verifyQuoted) return { action: "verify_displayed", target: verifyQuoted[1].trim() };
-  const verifyUnquoted = s.match(/^\s*(?:verify|check|assert|ensure|see)\s+(?:that\s+)?(.+?)\s+is\s+(?:displayed|visible|shown)\s*$/i);
-  if (verifyUnquoted) return { action: "verify_displayed", target: verifyUnquoted[1].trim() };
-  const checkThat = s.match(/^\s*check\s+that\s+['"]?(.+?)['"]?\s+is\s+(?:displayed|visible|shown)\s*$/i);
-  if (checkThat) return { action: "verify_displayed", target: checkThat[1].trim() };
-  return null;
-}
-
-const PORT = 4000;
+const PORT = 4001;
 const SCREENSHOT_INTERVAL_MS = 100;
 const DEFAULT_START_URL = "https://www.google.com";
 const MAX_FIND_ATTEMPTS = 3;
@@ -96,8 +39,10 @@ async function clickOrHoverByText(page, targetText, action, opts = {}) {
     try {
       const n = await locator.count();
       if (n === 0) return false;
-      if (action === "click") await locator.first().click({ timeout, force: true });
-      else await locator.first().hover({ timeout, force: true });
+      const first = locator.first();
+      await first.scrollIntoViewIfNeeded();
+      if (action === "click") await first.click({ timeout, force: true });
+      else await first.hover({ timeout, force: true });
       return true;
     } catch (_) {
       return false;
@@ -119,25 +64,27 @@ async function clickOrHoverByText(page, targetText, action, opts = {}) {
  * @returns {Promise<boolean>} True if the element is visible.
  */
 async function isElementWithTextVisible(page, targetText, opts = {}) {
-  const timeout = opts.timeout ?? 3000;
+  const timeout = opts.timeout ?? 8000;
   const name = (targetText || "").trim();
   if (!name) return false;
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const nameRegex = new RegExp(escaped, "i");
-  const tryVisible = async (locator) => {
+  const tryScrollAndVisible = async (locator) => {
     try {
       const n = await locator.count();
       if (n === 0) return false;
-      return await locator.first().isVisible({ timeout });
+      const first = locator.first();
+      await first.scrollIntoViewIfNeeded();
+      return await first.isVisible({ timeout });
     } catch (_) {
       return false;
     }
   };
-  if (await tryVisible(page.getByRole("link", { name: nameRegex }))) return true;
-  if (await tryVisible(page.getByRole("button", { name: nameRegex }))) return true;
-  if (await tryVisible(page.getByRole("menuitem", { name: nameRegex }))) return true;
-  if (await tryVisible(page.getByText(name, { exact: true }))) return true;
-  if (await tryVisible(page.getByText(nameRegex))) return true;
+  if (await tryScrollAndVisible(page.getByRole("link", { name: nameRegex }))) return true;
+  if (await tryScrollAndVisible(page.getByRole("button", { name: nameRegex }))) return true;
+  if (await tryScrollAndVisible(page.getByRole("menuitem", { name: nameRegex }))) return true;
+  if (await tryScrollAndVisible(page.getByText(name, { exact: true }))) return true;
+  if (await tryScrollAndVisible(page.getByText(nameRegex))) return true;
   return false;
 }
 
@@ -145,6 +92,10 @@ async function isElementWithTextVisible(page, targetText, opts = {}) {
 const HIGHLIGHT_DURATION_MS = 1800;
 /** Pause after applying highlight so the next screenshot frame captures it. */
 const HIGHLIGHT_PAUSE_MS = 280;
+/** Wait for element to be visible (e.g. inside modal); modals can take time to render. */
+const INTERACTION_VISIBLE_TIMEOUT_MS = 12000;
+/** Default click/fill timeout; retry with force if visibility fails. */
+const INTERACTION_CLICK_TIMEOUT_MS = 8000;
 
 /**
  * Highlights the element matching selector in the page (red outline + box-shadow), then waits so the
@@ -173,6 +124,106 @@ async function highlightElement(page, selector, durationMs = HIGHLIGHT_DURATION_
     await new Promise((r) => setTimeout(r, HIGHLIGHT_PAUSE_MS));
   } catch (_) {
     // ignore: selector may be invalid or element gone
+  }
+}
+
+/**
+ * Waits for the element to be visible and scrolls it into view. Use before click/fill on elements
+ * inside modals or late-rendered UI (e.g. "Search gym" in Gym Selector modal).
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {string} selector - CSS selector.
+ * @param {number} [timeoutMs] - Max wait for visible (default INTERACTION_VISIBLE_TIMEOUT_MS).
+ */
+async function waitForVisibleAndScroll(page, selector, timeoutMs = INTERACTION_VISIBLE_TIMEOUT_MS) {
+  const loc = page.locator(selector).first();
+  await loc.waitFor({ state: "visible", timeout: timeoutMs });
+  await loc.scrollIntoViewIfNeeded();
+}
+
+/**
+ * Clicks the element; waits for visible, scrolls into view, highlights, then clicks. On "not visible" timeout, retries with force.
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {string} selector - CSS selector.
+ * @param {{ timeout?: number }} [opts] - Click timeout (default INTERACTION_CLICK_TIMEOUT_MS).
+ */
+async function clickWithVisibleOrForce(page, selector, opts = {}) {
+  const timeout = opts.timeout ?? INTERACTION_CLICK_TIMEOUT_MS;
+  await waitForVisibleAndScroll(page, selector);
+  await highlightElement(page, selector);
+  try {
+    await page.click(selector, { timeout });
+  } catch (e) {
+    const msg = (e && e.message) || "";
+    if (/not visible|Timeout.*exceeded|outside of the viewport/i.test(msg)) {
+      await page.click(selector, { timeout: 5000, force: true });
+    } else {
+      throw e;
+    }
+  }
+}
+
+/**
+ * Delay (in ms) after filling a typeahead/search field.
+ * Many UIs (e.g. Angular typeahead) filter the dropdown asynchronously after input;
+ * without this wait, the next step (e.g. "Select X") can run before results appear.
+ */
+const TYPEAHEAD_SETTLE_MS = 1200;
+
+/**
+ * Fills a hidden or off-screen input via JavaScript when Playwright's normal fill would time out
+ * (e.g. input inside a modal or typeahead that is in the DOM but not "visible" to Playwright).
+ * We set the value and dispatch events so frameworks (e.g. Angular ng-model) and typeaheads
+ * react; then we wait TYPEAHEAD_SETTLE_MS so the dropdown can update before the next step.
+ *
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {string} selector - CSS selector for the input.
+ * @param {string} value - Text to set in the input.
+ */
+async function fillHiddenInput(page, selector, value) {
+  await page.locator(selector).first().evaluate((el, v) => {
+    if (!el || typeof el.value === "undefined") return;
+    el.focus();
+    el.value = v;
+    // Standard events so the app's listeners (e.g. Angular) see the change
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    el.dispatchEvent(new Event("keyup", { bubbles: true }));
+    // InputEvent with inputType helps some frameworks treat this as real text input
+    if (typeof InputEvent !== "undefined") {
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, data: v, inputType: "insertText" }));
+    }
+  }, value);
+  // Give typeahead time to filter and show results before next step runs
+  await new Promise((r) => setTimeout(r, TYPEAHEAD_SETTLE_MS));
+}
+
+/**
+ * Fills an input: wait until visible, scroll into view, highlight, then fill.
+ * If the element is hidden (e.g. "Search gym" in a modal), falls back to fillHiddenInput.
+ *
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {string} selector - CSS selector for the input.
+ * @param {string} value - Text to type.
+ * @param {object} [opts] - Options.
+ * @param {number} [opts.timeout] - Max wait for element (default 8000).
+ * @param {number} [opts.waitAfterMs] - Optional delay after fill (e.g. for typeahead to filter before next step).
+ */
+async function fillWithVisibleWait(page, selector, value, opts = {}) {
+  const timeout = opts.timeout ?? INTERACTION_CLICK_TIMEOUT_MS;
+  const waitAfterMs = opts.waitAfterMs ?? 0;
+  try {
+    await waitForVisibleAndScroll(page, selector);
+    await highlightElement(page, selector);
+    await page.fill(selector, value, { timeout });
+    // For search/typeahead steps, wait so dropdown results load before the next step
+    if (waitAfterMs > 0) await new Promise((r) => setTimeout(r, waitAfterMs));
+  } catch (e) {
+    const msg = (e && e.message) || "";
+    if (/hidden|not visible|Timeout.*exceeded/i.test(msg)) {
+      await fillHiddenInput(page, selector, value);
+    } else {
+      throw e;
+    }
   }
 }
 
@@ -485,12 +536,16 @@ function processStepQueue(ws) {
       const target = msg.target;
       const hasInstruction = Boolean(msg.instruction && msg.instruction.trim());
       const parsedInstruction = hasInstruction ? parseInstructionDynamically(msg.instruction) : null;
+      // Handle "Verify X is displayed" steps: check visibility and send step_done with actual success
+      // so the frontend can mark the run as failed when verify fails (no false "all steps passed").
       const isVerifyDisplayed = parsedInstruction && parsedInstruction.action === "verify_displayed" && parsedInstruction.target;
       if (isVerifyDisplayed) {
         const verifyTarget = parsedInstruction.target;
-        const visible = await isElementWithTextVisible(activePage, verifyTarget, { timeout: 5000 });
-        sendLog(ws, visible ? "Step successful." : `"${verifyTarget}" is not displayed.`, visible ? "info" : "error", sessionId);
-        send(ws, "step_done", { success: visible, sessionId });
+        const visible = await isElementWithTextVisible(activePage, verifyTarget, { timeout: 8000 });
+        const verifyMsg = visible ? "Step successful." : `"${verifyTarget}" is not displayed.`;
+        sendLog(ws, verifyMsg, visible ? "info" : "error", sessionId);
+        // Include message on failure so the UI can show it as the test error (e.g. in test case status)
+        send(ws, "step_done", { success: visible, sessionId, message: visible ? undefined : verifyMsg });
         done = true;
       }
 
@@ -601,8 +656,7 @@ function processStepQueue(ws) {
             }
             if (resolvedAction === "click") {
               try {
-                await highlightElement(activePage, selector);
-                await activePage.click(selector, { timeout: 5000 });
+                await clickWithVisibleOrForce(activePage, selector);
               } catch (clickErr) {
                 const textTarget = resolvedTarget || target;
                 if (textTarget && (await clickOrHoverByText(activePage, String(textTarget), "click", { timeout: 5000 }))) {
@@ -616,8 +670,9 @@ function processStepQueue(ws) {
               }
             } else if (resolvedAction === "hover") {
               try {
+                await waitForVisibleAndScroll(activePage, selector);
                 await highlightElement(activePage, selector);
-                await activePage.hover(selector, { timeout: 5000 });
+                await activePage.hover(selector, { timeout: INTERACTION_CLICK_TIMEOUT_MS });
               } catch (hoverErr) {
                 const textTarget = resolvedTarget || target;
                 if (textTarget && (await clickOrHoverByText(activePage, String(textTarget), "hover", { timeout: 5000 }))) {
@@ -640,17 +695,25 @@ function processStepQueue(ws) {
                 }
               } catch (_) {}
               if (!finalSelector) throw new Error("No fillable input found for username/email");
-              await highlightElement(activePage, finalSelector);
               const isPassword =
                 /password/.test(String(resolvedTarget || "").toLowerCase()) ||
                 /password/.test(String(msg.instruction || "").toLowerCase());
               if (isPassword && resolvedValue) {
+                await waitForVisibleAndScroll(activePage, finalSelector);
+                await highlightElement(activePage, finalSelector);
                 await activePage.locator(finalSelector).focus();
                 await activePage.locator(finalSelector).pressSequentially(resolvedValue, { delay: 60 });
               } else {
-                await activePage.fill(finalSelector, resolvedValue);
+                // For search-type steps, wait after fill so typeahead dropdown can filter before "Select X"
+                const isSearchStep =
+                  String(resolvedTarget || "").toLowerCase() === "search" ||
+                  /search\s+gym|search\s+for|search\s+club/i.test(String(msg.instruction || ""));
+                await fillWithVisibleWait(activePage, finalSelector, resolvedValue, {
+                  waitAfterMs: isSearchStep ? TYPEAHEAD_SETTLE_MS : 0,
+                });
               }
             } else if (resolvedAction === "press") {
+              await waitForVisibleAndScroll(activePage, selector);
               await highlightElement(activePage, selector);
               await activePage.press(selector, msg.key || "Enter");
             }
@@ -683,13 +746,11 @@ function processStepQueue(ws) {
       } else if (selector || action === "navigate" || action === "wait") {
         try {
           if (action === "click" && selector) {
-            await highlightElement(activePage, selector);
-            await activePage.click(selector, { timeout: 5000 });
+            await clickWithVisibleOrForce(activePage, selector);
             sendLog(ws, "Step successful.", "info", sessionId);
             send(ws, "step_done", { success: true, sessionId });
           } else if ((action === "type" || action === "fill") && selector) {
-            await highlightElement(activePage, selector);
-            await activePage.fill(selector, msg.text ?? msg.value ?? "");
+            await fillWithVisibleWait(activePage, selector, msg.text ?? msg.value ?? "");
             sendLog(ws, "Step successful.", "info", sessionId);
             send(ws, "step_done", { success: true, sessionId });
           } else if (action === "navigate" && msg.url) {

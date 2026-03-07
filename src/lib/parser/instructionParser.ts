@@ -118,8 +118,10 @@ export function parseSingleInstruction(instruction: string): PlaywrightStepPaylo
   }
   if (lower.startsWith("wait ")) {
     const duration = instruction.replace(/^wait\s+/i, "").trim();
-    const ms = duration.match(/\d+/) ? parseInt(duration, 10) : 1000;
-    return { action: "wait", options: { timeout: ms } };
+    const numMatch = duration.match(/\d+/);
+    const num = numMatch ? parseInt(numMatch[0], 10) : 1;
+    const ms = /second|sec|s\b/i.test(duration) ? num * 1000 : Math.max(100, num);
+    return { action: "wait", value: ms, options: { timeout: ms } };
   }
   return null;
 }

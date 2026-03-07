@@ -5,22 +5,27 @@ import { useExecutionStore, getExecutionState } from "@/store/useExecutionStore"
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import { saveTestCasesToStorage } from "@/lib/testCasePersistence";
+import { saveTestCasesToStorage, loadTestCasesFromBackup, hasTestCasesBackup } from "@/lib/testCasePersistence";
+import { getMockTestCases } from "@/lib/mockTestCases";
 import { startMockExecution } from "@/services/mock";
 import { parseSingleInstruction } from "@/lib/parser";
 import type { TestCase, TestStep } from "@/types/execution";
-import { Play, Loader2, ChevronDown, ChevronRight, Plus, Trash2, Save } from "lucide-react";
+import { Play, Loader2, ChevronDown, ChevronRight, Plus, Trash2, Save, Square, Pause, PlayCircle, Pencil } from "lucide-react";
 
-/** Editable step: input that updates store on change, plus delete button. */
+/** Editable step: input that updates store on change, plus delete button. Syncs with monitor by highlighting active step and scrolling into view. */
 function EditableStep({
   testCaseId,
   step,
+  isActive,
+  stepRef,
   onUpdateStep,
   onDeleteStep,
   canDelete,
 }: {
   testCaseId: string;
   step: TestStep;
+  isActive: boolean;
+  stepRef?: React.RefObject<HTMLDivElement | null>;
   onUpdateStep: (testCaseId: string, stepId: string, updates: Partial<TestStep>) => void;
   onDeleteStep: (testCaseId: string, stepId: string) => void;
   canDelete: boolean;
@@ -33,15 +38,24 @@ function EditableStep({
   };
 
   return (
-    <div className="flex items-center gap-1 py-1 pl-6 pr-1 group">
-      <span className="shrink-0 text-[10px] text-muted-foreground w-5">{step.order + 1}.</span>
+    <div
+      ref={stepRef}
+      className={cn(
+        "flex items-center gap-1 py-1 pl-6 pr-1 group rounded transition-colors",
+        isActive && "bg-primary/15 ring-1 ring-primary/40"
+      )}
+    >
+      <span className={cn("shrink-0 text-[10px] w-5", isActive ? "text-primary font-medium" : "text-muted-foreground")}>
+        {step.order + 1}.
+      </span>
       <input
         type="text"
         value={step.instruction}
         onChange={(e) => handleChange(e.target.value)}
         className={cn(
           "flex-1 min-w-0 rounded border border-border bg-background px-2 py-1 text-xs text-foreground",
-          "focus:outline-none focus:ring-1 focus:ring-ring"
+          "focus:outline-none focus:ring-1 focus:ring-ring",
+          isActive && "border-primary/50"
         )}
         placeholder="e.g. click Submit"
       />
@@ -60,30 +74,59 @@ function EditableStep({
   );
 }
 
-/** Single row: name, status badge, expand chevron, Play. Expanded: list of editable steps, add/delete. */
+/** Single row: name, status badge, expand chevron, Play / Stop / Pause / Resume. Expanded: list of editable steps (active step highlighted and synced with monitor). */
 function TestCaseRow({
   testCase,
   activeId,
+  activeStepId,
+  activeStepRef,
   expanded,
+  isPaused,
   onSelect,
   onPlay,
+  onStop,
+  onPause,
+  onResume,
   onToggleExpand,
   onUpdateStep,
+  onUpdateTestCase,
   onAddStep,
   onDeleteStep,
 }: {
   testCase: TestCase;
   activeId: string | null;
+  activeStepId: string | null;
+  activeStepRef: React.RefObject<HTMLDivElement | null>;
   expanded: boolean;
+  isPaused: boolean;
   onSelect: (id: string) => void;
   onPlay: (id: string) => void;
+  onStop: (id: string) => void;
+  onPause: (id: string) => void;
+  onResume: (id: string) => void;
   onToggleExpand: (id: string) => void;
   onUpdateStep: (testCaseId: string, stepId: string, updates: Partial<TestStep>) => void;
+  onUpdateTestCase: (testCaseId: string, updates: Partial<TestCase>) => void;
   onAddStep: (testCaseId: string) => void;
   onDeleteStep: (testCaseId: string, stepId: string) => void;
 }) {
   const isActive = activeId === testCase.id;
   const isRunning = testCase.status === "running";
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [editName, setEditName] = useState(testCase.name);
+  useEffect(() => {
+    if (!isEditingTitle) setEditName(testCase.name);
+  }, [testCase.name, isEditingTitle]);
+
+  const handleSaveTitle = () => {
+    const trimmed = editName.trim();
+    if (trimmed && trimmed !== testCase.name) {
+      onUpdateTestCase(testCase.id, { name: trimmed });
+    } else {
+      setEditName(testCase.name);
+    }
+    setIsEditingTitle(false);
+  };
 
   const badgeVariant =
     testCase.status === "queued"
@@ -117,42 +160,121 @@ function TestCaseRow({
             <ChevronRight className="h-4 w-4" />
           )}
         </button>
-        <button
-          type="button"
-          onClick={() => onSelect(testCase.id)}
-          className="flex-1 min-w-0 text-left text-sm"
-        >
-          <span className="block truncate text-foreground">{testCase.name}</span>
-          <span className="text-[10px] text-muted-foreground">
-            {testCase.steps.length} step{testCase.steps.length !== 1 ? "s" : ""}
-          </span>
-        </button>
-        <Badge variant={badgeVariant} className="shrink-0 text-[10px] px-1.5">
-          {testCase.status}
-        </Badge>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!isRunning) onPlay(testCase.id);
-          }}
-          disabled={isRunning}
-          className={cn(
-            "shrink-0 rounded p-1.5 min-w-[32px] min-h-[32px] flex items-center justify-center transition-colors",
-            isRunning
-              ? "text-muted-foreground cursor-not-allowed"
-              : "text-accent hover:bg-accent/20"
-          )}
-          title={isRunning ? "Running…" : "Run test"}
-          aria-label={isRunning ? "Running" : "Run test"}
-        >
-          {isRunning ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
+        <div className="flex-1 min-w-0 flex items-center gap-1">
+          {isEditingTitle ? (
+            <input
+              type="text"
+              value={editName}
+              onChange={(e) => setEditName(e.target.value)}
+              onBlur={handleSaveTitle}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleSaveTitle();
+                if (e.key === "Escape") {
+                  setEditName(testCase.name);
+                  setIsEditingTitle(false);
+                }
+              }}
+              autoFocus
+              className={cn(
+                "flex-1 min-w-0 rounded border border-primary/50 bg-background px-1.5 py-0.5 text-xs text-foreground",
+                "focus:outline-none focus:ring-1 focus:ring-ring"
+              )}
+              aria-label="Edit test case title"
+            />
           ) : (
-            <Play className="h-4 w-4" />
+            <>
+              <button
+                type="button"
+                onClick={() => onSelect(testCase.id)}
+                className="flex-1 min-w-0 text-left text-sm"
+              >
+                <span className="block truncate text-foreground">{testCase.name}</span>
+                <span className="text-[10px] text-muted-foreground">
+                  {testCase.steps.length} step{testCase.steps.length !== 1 ? "s" : ""}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditName(testCase.name);
+                  setIsEditingTitle(true);
+                }}
+                className="shrink-0 rounded p-1 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                title="Edit test case title"
+                aria-label="Edit test case title"
+              >
+                <Pencil className="h-3 w-3" />
+              </button>
+            </>
           )}
-        </button>
+        </div>
+        <Badge variant={badgeVariant} className="shrink-0 text-[10px] px-1.5">
+          {testCase.status === "success" ? "Pass" : testCase.status}
+        </Badge>
+        {isRunning ? (
+          <>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onStop(testCase.id);
+              }}
+              className="shrink-0 rounded p-1.5 min-w-[28px] min-h-[28px] flex items-center justify-center text-destructive hover:bg-destructive/15 transition-colors"
+              title="Stop"
+              aria-label="Stop test"
+            >
+              <Square className="h-3.5 w-3.5" fill="currentColor" />
+            </button>
+            {isPaused ? (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onResume(testCase.id);
+                }}
+                className="shrink-0 rounded p-1.5 min-w-[28px] min-h-[28px] flex items-center justify-center text-accent hover:bg-accent/20 transition-colors"
+                title="Resume"
+                aria-label="Resume test"
+              >
+                <PlayCircle className="h-3.5 w-3.5" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onPause(testCase.id);
+                }}
+                className="shrink-0 rounded p-1.5 min-w-[28px] min-h-[28px] flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                title="Pause"
+                aria-label="Pause test"
+              >
+                <Pause className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onPlay(testCase.id);
+            }}
+            className={cn(
+              "shrink-0 rounded p-1.5 min-w-[32px] min-h-[32px] flex items-center justify-center transition-colors",
+              "text-accent hover:bg-accent/20"
+            )}
+            title="Run test"
+            aria-label="Run test"
+          >
+            <Play className="h-4 w-4" />
+          </button>
+        )}
       </div>
       {expanded && (
         <div className="border-t border-border bg-muted/30 pb-2 pt-1">
@@ -167,6 +289,8 @@ function TestCaseRow({
                   key={step.id}
                   testCaseId={testCase.id}
                   step={step}
+                  isActive={activeStepId === step.id}
+                  stepRef={activeStepId === step.id ? activeStepRef : undefined}
                   onUpdateStep={onUpdateStep}
                   onDeleteStep={onDeleteStep}
                   canDelete={true}
@@ -201,13 +325,26 @@ export function TestCasesSidebar({ className }: { className?: string }) {
   const testCases = useExecutionStore((s) => s.testCases);
   const setTestCases = useExecutionStore((s) => s.setTestCases);
   const activeTestCaseId = useExecutionStore((s) => s.activeTestCaseId);
+  const activeStepId = useExecutionStore((s) => s.activeStepId);
   const setActiveTestCase = useExecutionStore((s) => s.setActiveTestCase);
+  const setActiveStep = useExecutionStore((s) => s.setActiveStep);
   const updateTestCase = useExecutionStore((s) => s.updateTestCase);
   const updateStep = useExecutionStore((s) => s.updateStep);
   const addStep = useExecutionStore((s) => s.addStep);
   const deleteStep = useExecutionStore((s) => s.deleteStep);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [savedFeedback, setSavedFeedback] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const activeStepRef = useRef<HTMLDivElement>(null);
+  const pausedRef = useRef(false);
+  const resumeResolveRef = useRef<(() => void) | null>(null);
+
+  /** Sync sidebar with monitor: scroll the currently running step into view. */
+  useEffect(() => {
+    if (activeStepId && activeStepRef.current) {
+      activeStepRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [activeStepId]);
 
   /** Test cases are restored once by ResizableRunnerLayout (localStorage or seed). */
 
@@ -228,6 +365,16 @@ export function TestCasesSidebar({ className }: { className?: string }) {
     setExpandedId((prev) => (prev === id ? null : id));
   };
 
+  /** Wait-if-paused: returns a promise that resolves when not paused (used by execution loop). */
+  const getWaitIfPaused = () =>
+    new Promise<void>((resolve) => {
+      if (!pausedRef.current) {
+        resolve();
+        return;
+      }
+      resumeResolveRef.current = resolve;
+    });
+
   /** Run: pull latest test case and steps from store, then start execution. */
   const handlePlay = (id: string) => {
     const store = getExecutionState();
@@ -235,28 +382,71 @@ export function TestCasesSidebar({ className }: { className?: string }) {
     if (!tc || tc.status === "running") return;
 
     mockCleanupRef.current?.();
+    setPaused(false);
+    pausedRef.current = false;
+    resumeResolveRef.current = null;
 
     store.clearLogs();
+    store.setActiveStep(null);
+    tc.steps.forEach((s) => store.updateStep(id, s.id, { status: "idle" }));
     store.updateTestCase(id, {
       status: "running",
       startedAt: new Date().toISOString(),
     });
     store.setActiveTestCase(id);
+    setExpandedId(id); // expand so user sees steps synced with monitor
 
     const steps = tc.steps;
     const actions = {
       addLog: (entry: Parameters<typeof store.addLog>[0]) => store.addLog(entry),
       updateTestCase: (tid: string, updates: Parameters<typeof store.updateTestCase>[1]) => store.updateTestCase(tid, updates),
+      setActiveStep: store.setActiveStep,
+      updateStep: store.updateStep,
     };
     const opts = {
       getBridgeSend: () => getExecutionState().bridgeSend,
       getExecuteStep: () => getExecutionState().executeStep,
       getSessionId: () => getExecutionState().streamSessionId,
       getStepDelayMs: () => getExecutionState().stepDelayMs,
+      getWaitIfPaused,
       steps,
     };
 
     mockCleanupRef.current = startMockExecution(id, actions, opts);
+  };
+
+  /** Stop the running test case. */
+  const handleStop = (id: string) => {
+    if (activeTestCaseId !== id) return;
+    setPaused(false);
+    pausedRef.current = false;
+    resumeResolveRef.current?.();
+    resumeResolveRef.current = null;
+    mockCleanupRef.current?.();
+    mockCleanupRef.current = null;
+    getExecutionState().setActiveStep(null);
+    getExecutionState().updateTestCase(id, {
+      status: "failed",
+      error: "Stopped by user",
+      completedAt: new Date().toISOString(),
+    });
+    getExecutionState().addLog({ level: "info", message: "Test stopped by user.", testCaseId: id });
+  };
+
+  /** Pause the running test (next step will wait until Resume). */
+  const handlePause = (id: string) => {
+    if (activeTestCaseId !== id) return;
+    setPaused(true);
+    pausedRef.current = true;
+  };
+
+  /** Resume the paused test. */
+  const handleResume = (id: string) => {
+    if (activeTestCaseId !== id) return;
+    setPaused(false);
+    pausedRef.current = false;
+    resumeResolveRef.current?.();
+    resumeResolveRef.current = null;
   };
 
   const handleSave = () => {
@@ -276,26 +466,55 @@ export function TestCasesSidebar({ className }: { className?: string }) {
       <div className="border-b border-border p-3">
         <div className="flex items-center justify-between gap-2">
           <h1 className="text-sm font-semibold text-foreground">Test Cases</h1>
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={testCases.length === 0 || savedFeedback}
+          <div className="flex items-center gap-1">
+            {testCases.length === 0 && hasTestCasesBackup() && (
+              <button
+                type="button"
+                onClick={() => {
+                  const backup = loadTestCasesFromBackup();
+                  if (backup?.length) setTestCases(backup);
+                }}
+                className={cn(
+                  "shrink-0 rounded border border-primary/50 bg-primary/10 px-2 py-1 text-xs font-medium text-primary transition-colors",
+                  "hover:bg-primary/20"
+                )}
+                title="Restore tests from last backup (before they were cleared)"
+              >
+                Restore previous
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setTestCases(getMockTestCases())}
+              className={cn(
+                "shrink-0 rounded border border-border px-2 py-1 text-xs font-medium transition-colors",
+                "hover:bg-muted hover:border-foreground/30"
+              )}
+              title="Load sample test cases (replaces current list)"
+            >
+              Load samples
+            </button>
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={testCases.length === 0 || savedFeedback}
             className={cn(
               "shrink-0 rounded border border-border px-2 py-1 text-xs font-medium transition-colors",
               "hover:bg-muted hover:border-foreground/30 disabled:opacity-50 disabled:pointer-events-none",
               savedFeedback && "text-green-600 border-green-600/50"
             )}
             title="Save test cases to browser storage (persists after refresh)"
-          >
-            {savedFeedback ? (
-              "Saved!"
-            ) : (
-              <>
-                <Save className="inline h-3 w-3 mr-1 align-middle" aria-hidden />
-                Save
-              </>
-            )}
-          </button>
+            >
+              {savedFeedback ? (
+                "Saved!"
+              ) : (
+                <>
+                  <Save className="inline h-3 w-3 mr-1 align-middle" aria-hidden />
+                  Save
+                </>
+              )}
+            </button>
+          </div>
         </div>
         <p className="mt-0.5 text-xs text-muted-foreground">
           Click Play to run. Save to keep after refresh.
@@ -313,11 +532,18 @@ export function TestCasesSidebar({ className }: { className?: string }) {
                 key={tc.id}
                 testCase={tc}
                 activeId={activeTestCaseId}
+                activeStepId={activeStepId}
+                activeStepRef={activeStepRef}
                 expanded={expandedId === tc.id}
+                isPaused={paused && activeTestCaseId === tc.id}
                 onSelect={handleSelect}
                 onPlay={handlePlay}
+                onStop={handleStop}
+                onPause={handlePause}
+                onResume={handleResume}
                 onToggleExpand={handleToggleExpand}
                 onUpdateStep={updateStep}
+                onUpdateTestCase={updateTestCase}
                 onAddStep={addStep}
                 onDeleteStep={deleteStep}
               />

@@ -4,8 +4,8 @@ import { useRef, useEffect, useState } from "react";
 import { useExecutionStore, getExecutionState } from "@/store/useExecutionStore";
 import { cn } from "@/lib/utils";
 
-/** Bridge WebSocket URL (Express + ws server on port 4000). */
-const BRIDGE_WS_URL = "ws://localhost:4000";
+/** Bridge WebSocket URL (Express + ws server on port 4001). */
+const BRIDGE_WS_URL = "ws://localhost:4001";
 
 const DEFAULT_START_URL = "https://www.google.com";
 
@@ -140,6 +140,8 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
           target?: string;
           screenshot?: string;
           sessionId?: string;
+          /** From bridge step_done: true = step passed, false = e.g. verify_displayed failed */
+          success?: boolean;
         };
 
         if (parsed.type === "session_started" && parsed.sessionId) {
@@ -166,8 +168,18 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
           pendingStepRef.current = null;
           return;
         }
+        // Step finished: respect bridge's success flag so verify failures fail the run (no false "all passed")
         if (parsed.type === "step_done") {
-          pendingStepRef.current?.resolve({ success: true });
+          const success = parsed.success !== false;
+          if (success) {
+            pendingStepRef.current?.resolve({ success: true });
+          } else {
+            pendingStepRef.current?.reject({
+              success: false,
+              error: parsed.message ?? "Step failed",
+            });
+            pendingStepRef.current = null;
+          }
           return;
         }
         if (parsed.type === "error") {
@@ -295,7 +307,7 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-[#0d0d0d] px-4 text-center">
           <p className="text-muted-foreground text-sm">Waiting for browser connection…</p>
           <p className="text-muted-foreground/80 text-xs max-w-sm">
-            Start the bridge so the monitor can stream the browser: run <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">node bridge/server.js</code> in the project root (port 4000).
+            Start the bridge so the monitor can stream the browser: run <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">node bridge/server.js</code> in the project root (port 4001).
           </p>
         </div>
       )}

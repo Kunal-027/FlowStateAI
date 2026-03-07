@@ -20,6 +20,7 @@ export function MonitorPanel({ className }: { className?: string }) {
   const streamSessionId = useExecutionStore((s) => s.streamSessionId);
   const streamConnected = useExecutionStore((s) => s.streamConnected);
   const activeTestCaseId = useExecutionStore((s) => s.activeTestCaseId);
+  const activeStepId = useExecutionStore((s) => s.activeStepId);
   const testCases = useExecutionStore((s) => s.testCases);
   const selectedBrowser = useExecutionStore((s) => s.selectedBrowser);
 
@@ -29,6 +30,13 @@ export function MonitorPanel({ className }: { className?: string }) {
   const isRunning = activeCase?.status === "running";
   const hasStream = !!streamSessionId && streamConnected;
   const browserLabel = BROWSER_LABELS[selectedBrowser] ?? selectedBrowser;
+
+  const sortedSteps = activeCase?.steps.slice().sort((a, b) => a.order - b.order) ?? [];
+  const activeStepIndex = activeStepId ? sortedSteps.findIndex((s) => s.id === activeStepId) : -1;
+  const stepLabel =
+    isRunning && sortedSteps.length > 0 && activeStepIndex >= 0
+      ? `Step ${activeStepIndex + 1} of ${sortedSteps.length}`
+      : null;
 
   return (
     <section
@@ -49,7 +57,7 @@ export function MonitorPanel({ className }: { className?: string }) {
           {isRunning && (
             <span className="flex items-center gap-1.5 text-xs text-muted-foreground shrink-0">
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              Running…
+              {stepLabel ?? "Running…"}
             </span>
           )}
           <span

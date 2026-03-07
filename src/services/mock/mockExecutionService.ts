@@ -1,10 +1,14 @@
 import type { LogEntry } from "@/types/execution";
 import type { TestStep, PlaywrightStepPayload } from "@/types/execution";
 
-/** Actions required by the mock execution service to update store (logs and test case status). */
+/** Actions required by the mock execution service to update store (logs, test case status, active step). */
 export interface MockExecutionActions {
   addLog: (entry: Omit<LogEntry, "id" | "timestamp">) => void;
   updateTestCase: (id: string, updates: { status: string; completedAt?: string; error?: string }) => void;
+  /** Set the currently running step id (null when idle or between steps). Used to sync sidebar and monitor. */
+  setActiveStep?: (id: string | null) => void;
+  /** Update a step's status (e.g. running, success, failed). */
+  updateStep?: (testCaseId: string, stepId: string, updates: Partial<{ status: string }>) => void;
 }
 
 /** Result of executing a step via the bridge (step_done / error / ambiguity_error). */
@@ -51,17 +55,26 @@ export function toStepMessage(step: TestStep): StepMessage {
     return { action: p.action, target };
   }
   if (p.action === "wait") {
-    const ms = typeof p.value === "number" ? p.value : parseWaitMs(step.instruction);
-    return { action: "wait", value: ms };
+    const ms =
+      typeof p.value === "number"
+        ? p.value
+        : typeof (p.options as { timeout?: number } | undefined)?.timeout === "number"
+          ? (p.options as { timeout: number }).timeout
+          : parseWaitMs(step.instruction);
+    return { action: "wait", value: Math.max(100, ms) };
   }
   const target = p.text ?? step.instruction;
   return { action: p.action, target, value: p.value };
 }
 
-/** Parse "wait 1 second" / "wait 2s" etc. into milliseconds. */
+/** Parse "wait 5 seconds" / "wait for 5 seconds" / "wait 2s" etc. into milliseconds. */
 function parseWaitMs(instruction: string): number {
-  const match = instruction.match(/wait\s+(\d+)\s*(s|sec|second|seconds)?/i);
-  if (match) return Math.max(100, parseInt(match[1], 10) * 1000);
+  const match = instruction.match(/wait\s+(?:for\s+)?(\d+)\s*(s|sec|second|seconds)?/i);
+  if (match) {
+    const num = parseInt(match[1], 10);
+    const inSeconds = !!match[2] || /second|sec|s\b/i.test(instruction);
+    return Math.max(100, inSeconds ? num * 1000 : num);
+  }
   return 1000;
 }
 
@@ -87,6 +100,8 @@ export interface MockExecutionOptions {
   getSessionId?: () => string | null;
   /** Delay in ms after each step (so user can see where it clicked). 0–5000. */
   getStepDelayMs?: () => number;
+  /** If provided, awaited before each step; use to implement Pause (return pending promise when paused). */
+  getWaitIfPaused?: () => Promise<void>;
   steps?: TestStep[];
 }
 
@@ -109,6 +124,7 @@ export function startMockExecution(
   const getExecuteStep = options?.getExecuteStep;
   const getSessionId = options?.getSessionId;
   const getStepDelayMs = options?.getStepDelayMs;
+  const getWaitIfPaused = options?.getWaitIfPaused;
   const steps = options?.steps ?? [];
 
   /** Sends test_finished or test_failed to the bridge when a run completes, if bridge is connected. */
@@ -139,29 +155,46 @@ export function startMockExecution(
       const executeStep = getExecuteStep?.();
       if (executeStep) {
         const sortedSteps = [...steps].sort((a, b) => a.order - b.order);
-        const stepDelayMs = Math.max(0, Math.min(5000, getStepDelayMs?.() ?? 1000));
+        const setActiveStep = actions.setActiveStep;
+        const updateStep = actions.updateStep;
         for (let i = 0; i < sortedSteps.length; i++) {
           if (cancelled) return;
+          await getWaitIfPaused?.();
+          if (cancelled) return;
           const step = sortedSteps[i];
+          setActiveStep?.(step.id);
+          updateStep?.(testCaseId, step.id, { status: "running" });
           const stepMsg = { ...toStepMessage(step), instruction: step.instruction };
           try {
             const result = await executeStep(stepMsg);
+            updateStep?.(testCaseId, step.id, { status: result.success ? "success" : "failed" });
             if (!result.success) {
               actions.updateTestCase(testCaseId, { status: "failed", error: result.error, completedAt: new Date().toISOString() });
+              setActiveStep?.(null);
               notifyTestEnd(false);
               return;
             }
-            if (stepDelayMs > 0 && i < sortedSteps.length - 1) {
+            // Apply step delay after EVERY step (including last) so delay is visible and pause works before completion
+            const stepDelayMs = Math.max(0, Math.min(5000, getStepDelayMs?.() ?? 1000));
+            if (stepDelayMs > 0) {
               await delay(stepDelayMs);
+              if (cancelled) return;
+              await getWaitIfPaused?.();
               if (cancelled) return;
             }
           } catch (err) {
             const message = err && typeof err === "object" && "error" in err ? String((err as StepResult).error) : String(err);
+            updateStep?.(testCaseId, step.id, { status: "failed" });
             actions.updateTestCase(testCaseId, { status: "failed", error: message, completedAt: new Date().toISOString() });
+            setActiveStep?.(null);
             notifyTestEnd(false);
             return;
           }
         }
+        // Pause check after last step so user can pause before we mark complete
+        await getWaitIfPaused?.();
+        if (cancelled) return;
+        setActiveStep?.(null);
         actions.updateTestCase(testCaseId, { status: "success", completedAt: new Date().toISOString() });
         notifyTestEnd(true);
         actions.addLog({ level: "info", message: `All ${sortedSteps.length} step(s) completed successfully.`, testCaseId });
@@ -173,7 +206,7 @@ export function startMockExecution(
     if (steps.length > 0) {
       actions.addLog({
         level: "info",
-        message: "Bridge not connected. Start the bridge (port 4000) to run tests in the browser.",
+        message: "Bridge not connected. Start the bridge (port 4001) to run tests in the browser.",
         testCaseId,
       });
       mockTimeout = setTimeout(() => {
@@ -183,7 +216,7 @@ export function startMockExecution(
     } else {
       actions.addLog({
         level: "info",
-        message: "Bridge not connected. Start the bridge (port 4000) to run tests.",
+        message: "Bridge not connected. Start the bridge (port 4001) to run tests.",
         testCaseId,
       });
       mockTimeout = setTimeout(() => {

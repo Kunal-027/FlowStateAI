@@ -6,7 +6,7 @@ import { RunBar } from "@/components/runner/RunBar";
 import { MonitorPanel } from "@/components/runner/MonitorPanel";
 import { ConsoleOverlay } from "@/components/runner/ConsoleOverlay";
 import { PanelResizer } from "@/components/runner/PanelResizer";
-import { loadTestCasesFromStorage } from "@/lib/testCasePersistence";
+import { loadTestCasesFromStorage, loadTestCasesFromBackup } from "@/lib/testCasePersistence";
 import { getMockTestCases } from "@/lib/mockTestCases";
 import { useExecutionStore } from "@/store/useExecutionStore";
 
@@ -55,10 +55,15 @@ export function ResizableRunnerLayout({ children }: { children: React.ReactNode 
     if (restoredRef.current) return;
     restoredRef.current = true;
     const saved = loadTestCasesFromStorage();
-    if (saved !== null) {
+    if (saved !== null && saved.length > 0) {
       setTestCases(saved);
     } else {
-      setTestCases(getMockTestCases());
+      const backup = loadTestCasesFromBackup();
+      if (backup !== null && backup.length > 0) {
+        setTestCases(backup);
+      } else {
+        setTestCases(getMockTestCases());
+      }
     }
   }, [setTestCases]);
 

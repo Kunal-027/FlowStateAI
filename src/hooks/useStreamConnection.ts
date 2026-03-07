@@ -5,9 +5,9 @@ import { StreamClient } from "@/services/websocket";
 import { useExecutionStore } from "@/store/useExecutionStore";
 import type { WSServerMessage } from "@/services/websocket/types";
 
-/** Must match the bridge server (see bridge/server.js, port 4000). */
+/** Must match the bridge server (see bridge/server.js, port 4001). */
 const WS_URL =
-  process.env.NEXT_PUBLIC_WS_STREAM_URL ?? "ws://localhost:4000";
+  process.env.NEXT_PUBLIC_WS_STREAM_URL ?? "ws://localhost:4001";
 
 /**
  * Connects to the browser stream WebSocket when enabled; on each "frame" message pushes the frame

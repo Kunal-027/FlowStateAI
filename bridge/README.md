@@ -1,6 +1,24 @@
-# Bridge server (port 4000)
+# Bridge server (port 4001)
 
 WebSocket + Express server that runs a headless Playwright instance and streams screenshots to the frontend.
+
+## Step interpretation (dynamic, global)
+
+Steps are interpreted so **any phrasing** works for millions of users—no site-specific or locale-specific config.
+
+1. **AI first (recommended)**  
+   When `HUGGINGFACE_API_KEY` or `ANTHROPIC_API_KEY` is set, the bridge uses the LLM to turn natural language + DOM snapshot into `{ action, target, value }`. Any wording is supported.
+
+2. **Generic parser fallback**  
+   When AI is unavailable, `instructionParser.js` parses steps using **structure only** (verb + arguments):
+   - Fill: "Enter X in Y", "Fill Y with X", "Search [for] &lt;field&gt; &lt;value&gt;", "Type X - Y", etc.
+   - Click / hover: "Click [on] target", "Hover over X".
+   - Navigate: "Go to URL", "Navigate to URL".
+   - Verify: "Verify 'text' is displayed".
+   - No hardcoded app or site names—only verb patterns.
+
+3. **Fuzzy element matching**  
+   `elementFinder.js` scores elements by **query + words**: e.g. "search gym" produces variants `["search gym", "search", "gym"]`, so a placeholder "Search gym" matches without adding app-specific aliases. A small set of global aliases (e.g. login/sign in, submit) is used for common terms only.
 
 ## Run alongside Next.js
 

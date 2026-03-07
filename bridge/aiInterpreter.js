@@ -1,16 +1,18 @@
 /**
- * LLM Step Interpreter (Node/bridge). Uses Hugging Face Inference API so the user can
- * enter steps in ANY natural language (e.g. "Enter username admin@yc.com", "Type pwd in password", "Click Login").
- * The bridge calls this first; if the LLM fails or no API key is set, it falls back to regex + elementFinder.
- * Set HUGGINGFACE_API_KEY or HF_TOKEN. Optional: HF_MODEL to override the model (e.g. a smaller/faster one).
+ * LLM Step Interpreter (Node/bridge). Primary: Hugging Face Inference API. Fallback: Claude (Anthropic).
+ * If both fail or no keys, the bridge falls back to regex + elementFinder.
+ * Keys: HUGGINGFACE_API_KEY or HF_TOKEN (primary), ANTHROPIC_API_KEY (fallback only).
+ * Optional: HF_MODEL, ANTHROPIC_MODEL.
  */
 
 const { InferenceClient } = require("@huggingface/inference");
+const Anthropic = require("@anthropic-ai/sdk").default ?? require("@anthropic-ai/sdk");
 
-const DEFAULT_MODEL = process.env.HF_MODEL || "Qwen/Qwen2.5-72B-Instruct";
+const HF_MODEL = process.env.HF_MODEL || "Qwen/Qwen2.5-72B-Instruct";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-20241022";
 
 const SYSTEM_PROMPT = `You are a step interpreter for browser automation. The user can describe their goal in ANY natural language. Examples of valid phrasings:
-- "Enter username admin@yc.com" / "Enter username - admin@yc.com" / "Enter username \"admin@yc.com\"" / "Type admin@yc.com in username field"
+- "Enter username admin@yc.com" / "Enter username - admin@yc.com" / "Enter username \\"admin@yc.com\\"" / "Type admin@yc.com in username field"
 - "Fill password with secret123" / "Enter Password - admin123" / "Put mypass in password"
 - "Click Login" / "Click Sign in" / "Press Submit"
 - "Navigate to https://example.com" / "Go to google.com"
@@ -24,52 +26,35 @@ Rules:
 - value: Only for action "fill". Extract the exact text the user wants to type (email, password, search term, etc.).
 - Interpret ANY phrasing: "Enter X in Y", "Type X - Y", "Fill Y with X", "Put X in Y field", quoted values, etc. Return only valid JSON.`;
 
-let client = null;
+let hfClient = null;
+let anthropicClient = null;
 
-/**
- * Returns a singleton InferenceClient when HUGGINGFACE_API_KEY or HF_TOKEN is set.
- * Used by getAiAction to call the Hugging Face Inference API.
- * @returns {InferenceClient | null} The client instance or null if no token is configured.
- */
-function getClient() {
+function getHfClient() {
   const token = process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN;
   if (!token) return null;
-  if (!client) client = new InferenceClient(token);
-  return client;
+  if (!hfClient) hfClient = new InferenceClient(token);
+  return hfClient;
+}
+
+function getAnthropicClient() {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return null;
+  if (!anthropicClient) anthropicClient = new Anthropic({ apiKey: key });
+  return anthropicClient;
 }
 
 /**
- * Calls the Hugging Face Inference API (high-reasoning model) to interpret the user intent
- * and DOM snapshot into a single browser action. Used when the bridge has no hardcoded selector.
- * On API failure or invalid JSON, returns null so the bridge can fall back to the fuzzy elementFinder.
- * @param {string} intent - User goal / step instruction (e.g. "fill search with FlowState AI").
- * @param {unknown[]} domSnapshot - DOM snapshot from getDomSnapshotInPage (selector, tagName, id, text, etc.).
- * @returns {Promise<{ action: string, target: string, value?: string } | null>} Parsed action or null.
+ * Parses raw LLM text into a valid action object. Returns null if invalid.
+ * @param {string} raw - Raw content from LLM (may include ```json).
+ * @returns {{ action: string, target: string, value?: string } | null}
  */
-async function getAiAction(intent, domSnapshot) {
+function parseActionResult(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
   try {
-    const hf = getClient();
-    if (!hf) return null;
-
-    const snapshotStr = JSON.stringify((domSnapshot || []).slice(0, 150));
-    const userContent = `User goal: ${intent}\n\nDOM snapshot:\n${snapshotStr}`;
-
-    const response = await hf.chatCompletion({
-      model: DEFAULT_MODEL,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-      max_tokens: 256,
-      temperature: 0.1,
-    });
-
-    const raw = response.choices?.[0]?.message?.content?.trim();
-    if (!raw) return null;
-
-    const jsonStr = raw.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
+    const jsonStr = trimmed.replace(/^```json\s*/i, "").replace(/\s*```$/i, "").trim();
     const parsed = JSON.parse(jsonStr);
-
     if (
       parsed &&
       typeof parsed === "object" &&
@@ -83,10 +68,63 @@ async function getAiAction(intent, domSnapshot) {
         value: typeof parsed.value === "string" ? parsed.value : undefined,
       };
     }
-    return null;
   } catch (_) {
-    return null;
+    // ignore
   }
+  return null;
+}
+
+/**
+ * 1) Tries Hugging Face. 2) On failure or no key, tries Claude. 3) Returns null for regex fallback.
+ * @param {string} intent - User goal / step instruction.
+ * @param {unknown[]} domSnapshot - DOM snapshot from getDomSnapshotInPage.
+ * @returns {Promise<{ action: string, target: string, value?: string } | null>}
+ */
+async function getAiAction(intent, domSnapshot) {
+  const snapshotStr = JSON.stringify((domSnapshot || []).slice(0, 150));
+  const userContent = `User goal: ${intent}\n\nDOM snapshot:\n${snapshotStr}`;
+
+  // 1) Primary: Hugging Face
+  try {
+    const hf = getHfClient();
+    if (hf) {
+      const response = await hf.chatCompletion({
+        model: HF_MODEL,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userContent },
+        ],
+        max_tokens: 256,
+        temperature: 0.1,
+      });
+      const raw = response.choices?.[0]?.message?.content?.trim();
+      const result = parseActionResult(raw);
+      if (result) return result;
+    }
+  } catch (_) {
+    // HF failed; try Claude fallback
+  }
+
+  // 2) Fallback: Claude (only when HF unavailable or failed)
+  try {
+    const anthropic = getAnthropicClient();
+    if (anthropic) {
+      const message = await anthropic.messages.create({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 256,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userContent }],
+      });
+      const textBlock = message.content?.find((b) => b.type === "text");
+      const raw = textBlock?.text?.trim();
+      const result = parseActionResult(raw);
+      if (result) return result;
+    }
+  } catch (_) {
+    // Claude also failed; bridge will use regex
+  }
+
+  return null;
 }
 
 module.exports = { getAiAction };
