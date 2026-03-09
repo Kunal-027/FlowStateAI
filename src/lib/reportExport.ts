@@ -32,17 +32,46 @@ export function exportReportAsHtml(report: RunReport): string {
       const selfHealedBadge = step?.selfHealed
         ? '<span class="badge badge-heal">Self-healed</span>'
         : "";
+      const visualClickBadge = step?.visualClick
+        ? '<span class="badge badge-visual" title="' + escapeHtml(step?.discoveryReason ?? "AI Visual Discovery") + '">Visual Discovery</span>'
+        : "";
+      const resolvedByLabel =
+        step?.resolvedBy === "interpreter"
+          ? "Interpreter"
+          : step?.resolvedBy === "huggingface"
+            ? "Hugging Face"
+            : step?.resolvedBy === "claude"
+              ? "Claude (LLM)"
+              : step?.resolvedBy === "visual_discovery"
+                ? "Claude (Visual)"
+                : "";
+      const resolvedByBadge = resolvedByLabel
+        ? '<span class="badge badge-resolved" title="Step resolved by ' + escapeHtml(resolvedByLabel) + '">' + escapeHtml(resolvedByLabel) + "</span>"
+        : "";
+      const discoveryDetail =
+        step?.visualClick && step?.discoveryReason
+          ? "<p class=\"discovery-detail\"><strong>Discovery:</strong> " + escapeHtml(step.discoveryReason) + (step?.validationPassed === true ? " · Validation passed" : step?.validationPassed === false ? " · Unverified" : "") + "</p>"
+          : "";
+      const expectedEl = step?.expectedElement ?? step?.instruction ?? "";
+      const actualContent = step?.actualPageContent;
       const failureBlock =
         isFailed &&
-        "<p><strong>Expected:</strong> " +
-          escapeHtml(step?.instruction ?? "") +
-          "</p><p><strong>Actual:</strong> <span class=\"error\">" +
+        "<p><strong>Expected element:</strong> " +
+          escapeHtml(expectedEl || "—") +
+          "</p><p><strong>Error:</strong> <span class=\"error\">" +
           escapeHtml(step?.error ?? "Step failed") +
-          "</span></p>";
+          "</span></p>" +
+          (actualContent
+            ? "<p><strong>Actual page content (snippet):</strong></p><pre class=\"actual-snippet\">" +
+              escapeHtml(actualContent.slice(0, 3000)) +
+              (actualContent.length > 3000 ? "…" : "") +
+              "</pre>"
+            : "");
       const detailHtml =
-        isFailed || hasScreenshot
+        isFailed || hasScreenshot || discoveryDetail
           ? "<div class=\"step-detail\">" +
             (failureBlock || "") +
+            discoveryDetail +
             screenshotHtml +
             "</div>"
           : "";
@@ -57,6 +86,8 @@ export function exportReportAsHtml(report: RunReport): string {
         stepIcon +
         "</span>" +
         selfHealedBadge +
+        visualClickBadge +
+        resolvedByBadge +
         "<span class=\"step-num\">" +
         ((step?.order ?? 0) + 1) +
         ".</span>" +
@@ -100,12 +131,15 @@ export function exportReportAsHtml(report: RunReport): string {
     .step-num { color: #94a3b8; }
     .step-instr { flex: 1; }
     .badge-heal { background: rgba(139, 92, 246, 0.3); color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+    .badge-visual { background: rgba(34, 197, 94, 0.25); color: #4ade80; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+    .badge-resolved { background: rgba(100, 116, 139, 0.3); color: #94a3b8; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
     .step-detail { padding: 12px; border-top: 1px solid #334155; background: #0f172a; font-size: 0.875rem; }
     .step-detail p { margin: 0 0 8px; }
     .step-detail .error { color: #f87171; }
     .screenshot { margin-top: 8px; }
     .screenshot .label { color: #94a3b8; margin-bottom: 4px; }
     .screenshot img { max-width: 100%; border-radius: 4px; border: 1px solid #334155; }
+    .actual-snippet { font-size: 0.75rem; max-height: 200px; overflow: auto; padding: 8px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
   </style>
 </head>
 <body>

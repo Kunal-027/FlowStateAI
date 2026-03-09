@@ -13,7 +13,7 @@ export function RunnerLayoutClient({ children }: { children: React.ReactNode }) 
   return (
     <div className="flex h-screen w-full flex-col bg-background">
       <header className="flex items-center shrink-0 border-b border-border bg-card/60 px-4 py-2">
-        <AppBrand />
+        <AppBrand href="/" />
       </header>
       <ResizableRunnerLayout>{children}</ResizableRunnerLayout>
     </div>

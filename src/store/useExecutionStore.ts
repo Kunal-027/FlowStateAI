@@ -33,7 +33,12 @@ export interface ExecutionState {
   /** Send a message to the bridge (set when stream connects, cleared on disconnect). */
   bridgeSend: ((msg: object) => void) | null;
   /** Execute a step and wait for result (resolves on step_done, rejects on error/ambiguity_error). */
-  executeStep: ((stepMsg: object) => Promise<{ success: boolean; error?: string; screenshot?: string }>) | null;
+  executeStep: ((stepMsg: object) => Promise<{
+    success: boolean;
+    error?: string;
+    screenshot?: string;
+    resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
+  }>) | null;
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -64,7 +69,12 @@ export interface ExecutionActions {
   /** Register/unregister the bridge send function (used by BrowserCanvas). */
   setBridgeSend: (fn: ((msg: object) => void) | null) => void;
   /** Register/unregister executeStep (used by BrowserCanvas when stream connects). */
-  setExecuteStep: (fn: ((stepMsg: object) => Promise<{ success: boolean; error?: string; screenshot?: string }>) | null) => void;
+  setExecuteStep: (fn: ((stepMsg: object) => Promise<{
+    success: boolean;
+    error?: string;
+    screenshot?: string;
+    resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
+  }>) | null) => void;
   /** Reset store to initial state */
   reset: () => void;
 }

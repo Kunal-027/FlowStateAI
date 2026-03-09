@@ -35,14 +35,68 @@ export function parseInstructionsToSteps(
   });
 }
 
+/** Common typos so parsed target matches DOM text (e.g. "Companies" in the UI). */
+const COMMON_TYPO_CORRECTIONS: Record<string, string> = {
+  comapnies: "companies",
+  compaines: "companies",
+  companys: "companies",
+  settigns: "settings",
+  setings: "settings",
+  dashbord: "dashboard",
+  dashborad: "dashboard",
+  logn: "login",
+  sigin: "sign in",
+  sigout: "sign out",
+  serach: "search",
+  serch: "search",
+};
+
+/**
+ * Extracts the click/hover target from the remainder after the verb.
+ * e.g. "on 'Companies' Menu" → "Companies Menu", "Login" → "Login".
+ */
+function extractClickTarget(rest: string): string {
+  const s = rest.trim();
+  const quoted = s.match(/^(?:on\s+)?["']([^"']+)["']\s*(.*)$/i);
+  if (quoted) {
+    const part = quoted[1].trim();
+    const trail = (quoted[2] ?? "").trim();
+    return trail ? `${part} ${trail}` : part;
+  }
+  return s.replace(/^on\s+/i, "").trim() || s;
+}
+
+function applyTypoCorrection(phrase: string): string {
+  if (!phrase.trim()) return phrase;
+  return phrase
+    .trim()
+    .split(/\s+/)
+    .map((w) => COMMON_TYPO_CORRECTIONS[w.toLowerCase()] ?? w)
+    .join(" ");
+}
+
 /**
  * Parses one instruction string (e.g. "Click Submit", "fill email with x@y.com") into a Playwright payload.
  * Supports: click, fill, navigate, assert, select, hover, wait. Returns null if unrecognized.
+ * Parses targets well (e.g. "Click on 'Companies' Menu" → text: "Companies Menu") so the bridge has a clear target.
  */
 export function parseSingleInstruction(instruction: string): PlaywrightStepPayload | null {
   const lower = instruction.trim().toLowerCase();
-  if (lower.startsWith("click ")) {
-    const text = instruction.replace(/^click\s+/i, "").trim();
+  /** "Select X from Y" → dropdown; "Select X" / "Click on X" → click */
+  if (lower.startsWith("select ") && lower.includes(" from ")) {
+    const match = instruction.match(/select\s+(.+?)\s+from\s+(.+)/i);
+    const value = match?.[1]?.trim();
+    const label = match?.[2]?.trim();
+    return {
+      action: "select",
+      selector: label ? `select:has(option:has-text("${label}"))` : "select",
+      value: value ?? undefined,
+    };
+  }
+  if (lower.startsWith("click ") || lower.startsWith("select ") || lower.startsWith("press ") || lower.startsWith("tap ")) {
+    const rest = instruction.replace(/^(?:click|select|press|tap)\s+(?:on\s+)?/i, "").trim();
+    const raw = extractClickTarget(rest);
+    const text = applyTypoCorrection(raw);
     return {
       action: "click",
       selector: `button:has-text("${text}"), a:has-text("${text}"), [role="button"]:has-text("${text}")`,
@@ -98,18 +152,10 @@ export function parseSingleInstruction(instruction: string): PlaywrightStepPaylo
       text,
     };
   }
-  if (lower.startsWith("select ")) {
-    const match = instruction.match(/select\s+(.+?)\s+from\s+(.+)/i);
-    const value = match?.[1]?.trim();
-    const label = match?.[2]?.trim();
-    return {
-      action: "select",
-      selector: label ? `select:has(option:has-text("${label}"))` : "select",
-      value: value ?? undefined,
-    };
-  }
   if (lower.startsWith("hover ")) {
-    const text = instruction.replace(/^hover\s+/i, "").trim();
+    const rest = instruction.replace(/^hover\s+(?:on\s+)?/i, "").trim();
+    const raw = extractClickTarget(rest);
+    const text = applyTypoCorrection(raw);
     return {
       action: "hover",
       selector: `text=${text}`,

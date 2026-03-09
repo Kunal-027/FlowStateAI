@@ -27,6 +27,9 @@ yarn-error.log*
 .env*.local
 .env
 
+# bridge selector healing cache (local, machine-specific)
+.flowstate-selector-cache.json
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

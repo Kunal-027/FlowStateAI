@@ -1,8 +1,7 @@
 /**
- * LLM Step Interpreter (Node/bridge). Primary: Hugging Face Inference API. Fallback: Claude (Anthropic).
- * If both fail or no keys, the bridge falls back to regex + elementFinder.
- * Keys: HUGGINGFACE_API_KEY or HF_TOKEN (primary), ANTHROPIC_API_KEY (fallback only).
- * Optional: HF_MODEL, ANTHROPIC_MODEL.
+ * LLM Step Interpreter. Same contract as instructionParser: { action, target, value? }.
+ * Primary: Hugging Face. Fallback: Claude. Keys: HUGGINGFACE_API_KEY or HF_TOKEN, ANTHROPIC_API_KEY.
+ * Use when parser returns null or when DOM disambiguation is needed (e.g. which "Submit" button).
  */
 
 const { InferenceClient } = require("@huggingface/inference");
@@ -11,20 +10,34 @@ const Anthropic = require("@anthropic-ai/sdk").default ?? require("@anthropic-ai
 const HF_MODEL = process.env.HF_MODEL || "Qwen/Qwen2.5-72B-Instruct";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-20241022";
 
-const SYSTEM_PROMPT = `You are a step interpreter for browser automation. The user can describe their goal in ANY natural language. Examples of valid phrasings:
-- "Enter username admin@yc.com" / "Enter username - admin@yc.com" / "Enter username \\"admin@yc.com\\"" / "Type admin@yc.com in username field"
-- "Fill password with secret123" / "Enter Password - admin123" / "Put mypass in password"
-- "Click Login" / "Click Sign in" / "Press Submit"
-- "Navigate to https://example.com" / "Go to google.com"
+/** Canonical actions (must match instructionParser.ACTIONS for fill/click/navigate/hover/submit_search). */
+const VALID_ACTIONS = ["click", "fill", "navigate", "press", "hover", "submit_search"];
 
-Your job: from the user goal and the DOM snapshot, output exactly one JSON object (no other text, no markdown):
-{ "action": "click" | "fill" | "navigate" | "press" | "hover", "target": "short element description or selector from snapshot", "value": "for fill only: the text to type" }
+const SYSTEM_PROMPT = `You are a step interpreter for browser automation. Output exactly one JSON object (no other text, no markdown).
+
+Output format: { "action": "<action>", "target": "<short description or selector>", "value": "<only for fill>" }
 
 Rules:
-- action: click (buttons/links), fill (inputs), navigate (URLs), press (key), hover.
-- target: Use a selector from the snapshot (e.g. [data-fs-id="fs-5"]) if you can match the right element; otherwise use a short description (e.g. "username", "password", "Login button", "search input") so the system can fuzzy-match. For fill, target is the field (username, email, password, search). For navigate, target is the URL.
-- value: Only for action "fill". Extract the exact text the user wants to type (email, password, search term, etc.).
-- Interpret ANY phrasing: "Enter X in Y", "Type X - Y", "Fill Y with X", "Put X in Y field", quoted values, etc. Return only valid JSON.`;
+- action must be one of: click | fill | navigate | press | hover | submit_search
+- target: short element description (e.g. "Login", "search", "Nike shoes") or a selector from the snapshot if you use one
+- value: only for action "fill". The exact text to type (e.g. "Nike Shoes", "admin@test.com")
+
+Critical mappings (use these exactly):
+1. "Click Search Button" / "Submit search" / "Press search" → action: "submit_search", target: "search", no value
+2. "Search X" / "Search for X" → action: "fill", target: "search", value: "X" (e.g. value: "Nike Shoes")
+3. "Click on X" / "Click on any X" → action: "click", target: "X" (e.g. target: "Nike shoes" or "any Nike shoes")
+4. "Enter X in Y" / "Fill Y with X" → action: "fill", target: "Y", value: "X"
+5. "Navigate to URL" / "Go to URL" → action: "navigate", target: URL, value: URL
+6. Buttons/links (Login, Submit, Add to cart) → action: "click", target: that text
+
+Examples:
+- "Search Nike Shoes" → {"action":"fill","target":"search","value":"Nike Shoes"}
+- "Click Search Button" → {"action":"submit_search","target":"search"}
+- "Click on any Nike shoes" → {"action":"click","target":"Nike shoes"}
+- "Enter email user@test.com" → {"action":"fill","target":"email","value":"user@test.com"}
+- "Navigate to https://amazon.com" → {"action":"navigate","target":"https://amazon.com","value":"https://amazon.com"}
+
+Return only valid JSON.`;
 
 let hfClient = null;
 let anthropicClient = null;
@@ -44,7 +57,22 @@ function getAnthropicClient() {
 }
 
 /**
+ * Normalizes LLM output to avoid known failures (e.g. click on search button → submit_search).
+ * @param {{ action: string, target: string, value?: string }} result - Parsed AI result.
+ * @returns {{ action: string, target: string, value?: string }}
+ */
+function normalizeAiResult(result) {
+  if (!result || result.action !== "click") return result;
+  const t = (result.target || "").toLowerCase();
+  if (/search\s*button|submit\s*search|search\s+button/.test(t) || (t.includes("search") && t.includes("button"))) {
+    return { action: "submit_search", target: "search", value: result.value };
+  }
+  return result;
+}
+
+/**
  * Parses raw LLM text into a valid action object. Returns null if invalid.
+ * Result is normalized (e.g. click+search button → submit_search).
  * @param {string} raw - Raw content from LLM (may include ```json).
  * @returns {{ action: string, target: string, value?: string } | null}
  */
@@ -60,13 +88,14 @@ function parseActionResult(raw) {
       typeof parsed === "object" &&
       typeof parsed.action === "string" &&
       typeof parsed.target === "string" &&
-      ["click", "fill", "navigate", "press", "hover"].includes(parsed.action)
+      VALID_ACTIONS.includes(parsed.action)
     ) {
-      return {
+      const result = {
         action: parsed.action,
-        target: parsed.target,
-        value: typeof parsed.value === "string" ? parsed.value : undefined,
+        target: parsed.target.trim(),
+        value: typeof parsed.value === "string" ? parsed.value.trim() : undefined,
       };
+      return normalizeAiResult(result);
     }
   } catch (_) {
     // ignore
@@ -75,7 +104,7 @@ function parseActionResult(raw) {
 }
 
 /**
- * 1) Tries Hugging Face. 2) On failure or no key, tries Claude. 3) Returns null for regex fallback.
+ * 1) Tries Hugging Face. 2) On failure or no key, tries Claude. 3) Returns null for parser fallback.
  * @param {string} intent - User goal / step instruction.
  * @param {unknown[]} domSnapshot - DOM snapshot from getDomSnapshotInPage.
  * @returns {Promise<{ action: string, target: string, value?: string } | null>}
@@ -84,7 +113,6 @@ async function getAiAction(intent, domSnapshot) {
   const snapshotStr = JSON.stringify((domSnapshot || []).slice(0, 150));
   const userContent = `User goal: ${intent}\n\nDOM snapshot:\n${snapshotStr}`;
 
-  // 1) Primary: Hugging Face
   try {
     const hf = getHfClient();
     if (hf) {
@@ -99,13 +127,12 @@ async function getAiAction(intent, domSnapshot) {
       });
       const raw = response.choices?.[0]?.message?.content?.trim();
       const result = parseActionResult(raw);
-      if (result) return result;
+      if (result) return { ...result, _provider: "huggingface" };
     }
   } catch (_) {
-    // HF failed; try Claude fallback
+    // Hugging Face failed (error or no key); fall back to Claude
   }
 
-  // 2) Fallback: Claude (only when HF unavailable or failed)
   try {
     const anthropic = getAnthropicClient();
     if (anthropic) {
@@ -118,13 +145,11 @@ async function getAiAction(intent, domSnapshot) {
       const textBlock = message.content?.find((b) => b.type === "text");
       const raw = textBlock?.text?.trim();
       const result = parseActionResult(raw);
-      if (result) return result;
+      if (result) return { ...result, _provider: "claude" };
     }
-  } catch (_) {
-    // Claude also failed; bridge will use regex
-  }
+  } catch (_) {}
 
   return null;
 }
 
-module.exports = { getAiAction };
+module.exports = { getAiAction, parseActionResult, normalizeAiResult, VALID_ACTIONS };

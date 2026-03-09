@@ -1,4 +1,4 @@
-# Bridge server (port 4001)
+# Bridge server (port 4000)
 
 WebSocket + Express server that runs a headless Playwright instance and streams screenshots to the frontend.
 
@@ -6,11 +6,11 @@ WebSocket + Express server that runs a headless Playwright instance and streams 
 
 Steps are interpreted so **any phrasing** works for millions of users—no site-specific or locale-specific config.
 
-1. **AI first (recommended)**  
-   When `HUGGINGFACE_API_KEY` or `ANTHROPIC_API_KEY` is set, the bridge uses the LLM to turn natural language + DOM snapshot into `{ action, target, value }`. Any wording is supported.
+1. **LLM first (every step)**  
+   For each step we call the LLM with the user instruction + DOM snapshot and get `{ action, target, value }`. Any wording works (e.g. "Click the Companies menu", "Hit the login button", "Put my email in the box"). Set `HUGGINGFACE_API_KEY` or `ANTHROPIC_API_KEY` in `.env`.
 
-2. **Generic parser fallback**  
-   When AI is unavailable, `instructionParser.js` parses steps using **structure only** (verb + arguments):
+2. **Static parser fallback only when LLM returns nothing**  
+   When the LLM is unavailable (no key, or API failed), `instructionParser.js` parses using **structure only** (verb + arguments):
    - Fill: "Enter X in Y", "Fill Y with X", "Search [for] &lt;field&gt; &lt;value&gt;", "Type X - Y", etc.
    - Click / hover: "Click [on] target", "Hover over X".
    - Navigate: "Go to URL", "Navigate to URL".

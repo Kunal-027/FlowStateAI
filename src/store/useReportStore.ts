@@ -43,6 +43,12 @@ export function buildReportFromTestCase(tc: TestCase): RunReport {
       error: s.error,
       screenshot: s.screenshot,
       selfHealed: (s.healingAttempts ?? 0) > 0,
+      visualClick: s.visualClick,
+      discoveryReason: s.discoveryReason,
+      validationPassed: s.validationPassed,
+      resolvedBy: s.resolvedBy,
+      expectedElement: s.expectedElement,
+      actualPageContent: s.actualPageContent,
       startedAt: s.startedAt,
       completedAt: s.completedAt,
     }));

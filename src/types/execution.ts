@@ -40,10 +40,22 @@ export interface TestStep {
   error?: string;
   /** Base64 screenshot when step failed (e.g. from bridge ambiguity_error). */
   screenshot?: string;
+  /** For failed steps: what we tried to find (e.g. instruction). Used in HTML report. */
+  expectedElement?: string;
+  /** For failed steps: sanitized page snippet when step failed. Used in HTML report. */
+  actualPageContent?: string;
   /** Self-healing attempts made for this step */
   healingAttempts: number;
   /** Retry count (for exponential backoff) */
   retryCount: number;
+  /** True if step succeeded via visual fallback (AI Visual Discovery). */
+  visualClick?: boolean;
+  /** AI reason when visual discovery was used (for hit-rate monitoring). */
+  discoveryReason?: string;
+  /** True when post-click validation passed (e.g. URL changed). */
+  validationPassed?: boolean;
+  /** Which resolved this step: interpreter, huggingface, claude, or visual_discovery. */
+  resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
   /** Timestamps for reporting */
   startedAt?: string;
   completedAt?: string;
@@ -117,6 +129,18 @@ export interface ReportStep {
   screenshot?: string;
   /** True if self-healing was used for this step (show purple badge). */
   selfHealed: boolean;
+  /** True if step succeeded via visual fallback (AI Visual Discovery). */
+  visualClick?: boolean;
+  /** AI reason when Visual Discovery was used (for hit-rate monitoring). */
+  discoveryReason?: string;
+  /** True when post-click validation passed (e.g. URL changed). */
+  validationPassed?: boolean;
+  /** Which resolved this step: interpreter, huggingface, claude, or visual_discovery. */
+  resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
+  /** For failed steps: expected element (e.g. instruction) for HTML report. */
+  expectedElement?: string;
+  /** For failed steps: actual page content snippet for HTML report. */
+  actualPageContent?: string;
   startedAt?: string;
   completedAt?: string;
 }

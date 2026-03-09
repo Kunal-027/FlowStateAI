@@ -3,17 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3001",
+    "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
     "bridge": "node bridge/server.js",
     "bridge:watch": "nodemon --watch bridge --ext js bridge/server.js",
     "dev:all": "concurrently \"npm run dev\" \"npm run bridge:watch\"",
-    "kill-ports": "node scripts/kill-ports.js 3001 4001",
+    "kill-ports": "node scripts/kill-ports.js 3000 4000",
+    "clean-and-kill": "node scripts/clean-and-kill.js",
     "clean": "node scripts/clean-next.js",
     "clean:trace": "node scripts/clean-trace.js",
-    "dev:fresh": "node scripts/kill-ports.js 3001 4001 && node scripts/clean-next.js && npm run dev:all",
+    "dev:fresh": "node scripts/kill-ports.js 3000 4000 && node scripts/clean-next.js && npm run dev:all",
     "fresh": "node scripts/kill-ports.js 3000 4000 && node scripts/clean-next.js && next dev -p 3000"
   },
   "dependencies": {

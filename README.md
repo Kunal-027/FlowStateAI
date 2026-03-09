@@ -70,24 +70,24 @@ npm run dev
 npm run bridge
 ```
 
-- App: [http://localhost:3000](http://localhost:3000) (or 3001 if 3000 is in use)
+- App: [http://localhost:3000](http://localhost:3000)
 - Test Runner: [http://localhost:3000/runner](http://localhost:3000/runner)
 - Bridge: `ws://localhost:4000`
 
 ## Troubleshooting
 
-**"Internal server error" / Next.js crashes with `EPERM: operation not permitted, open '.next\trace'`**
+**"EPERM: operation not permitted, open '.next\\trace'"**
 
-- This usually happens when the `.next` folder is locked (e.g. another Next.js process or the IDE).
-- **Fix:** Stop all running dev servers (Ctrl+C in every terminal running `npm run dev` or `npm run dev:all`). Close any other app that might be using the project folder. Then delete the `.next` folder (in File Explorer or `rmdir /s /q .next` in cmd, or `Remove-Item -Recurse -Force .next` in PowerShell). Restart with `npm run dev` or `npm run dev:all`.
+- The `.next` folder is locked (another Next.js/Node process or the IDE has it open).
+- **Fix:** Run **`npm run clean-and-kill`** from the project root. It stops all Node processes and deletes `.next`. Then run `npm run dev` again. If it still fails, close Cursor/VS Code, run `npm run clean-and-kill` again, then reopen and start dev.
 
-**"Address already in use :::4000"**
+**"Address already in use" (port 3000 or 4000) / terminal lost**
 
-- The bridge is already running (e.g. from a previous `npm run dev:all`). Either use that running bridge, or stop it (Ctrl+C in the terminal that started it) before starting the bridge again.
+- Run from the project root: **`npm run kill-ports`** to stop whatever is using ports 3000 and 4000. See [KILL-PORTS.md](KILL-PORTS.md) for more commands (including from any folder).
 
 ## Env (optional)
 
-- `NEXT_PUBLIC_WS_STREAM_URL` – WebSocket URL for browser stream (default: `ws://localhost:3001/stream`)
+- `NEXT_PUBLIC_WS_STREAM_URL` – WebSocket URL for browser stream (default: `ws://localhost:4000`)
 - `NEXT_PUBLIC_EXECUTION_API` – Base URL for cloud execution API (default: `/api`)
 
 ## Next steps

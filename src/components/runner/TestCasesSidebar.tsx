@@ -29,6 +29,7 @@ function EditableStep({
   stepRef?: React.RefObject<HTMLDivElement | null>;
   onUpdateStep: (testCaseId: string, stepId: string, updates: Partial<TestStep>) => void;
   onDeleteStep: (testCaseId: string, stepId: string) => void;
+  onStepBlur?: () => void;
   canDelete: boolean;
 }) {
   const handleChange = (value: string) => {
@@ -53,6 +54,7 @@ function EditableStep({
         type="text"
         value={step.instruction}
         onChange={(e) => handleChange(e.target.value)}
+        onBlur={() => onStepBlur?.()}
         className={cn(
           "flex-1 min-w-0 rounded border border-border bg-background px-2 py-1 text-xs text-foreground",
           "focus:outline-none focus:ring-1 focus:ring-ring",
@@ -93,6 +95,7 @@ function TestCaseRow({
   onUpdateTestCase,
   onAddStep,
   onDeleteStep,
+  onStepBlur,
 }: {
   testCase: TestCase;
   activeId: string | null;
@@ -110,6 +113,7 @@ function TestCaseRow({
   onUpdateTestCase: (testCaseId: string, updates: Partial<TestCase>) => void;
   onAddStep: (testCaseId: string) => void;
   onDeleteStep: (testCaseId: string, stepId: string) => void;
+  onStepBlur?: () => void;
 }) {
   const isActive = activeId === testCase.id;
   const isRunning = testCase.status === "running";
@@ -294,6 +298,7 @@ function TestCaseRow({
                   stepRef={activeStepId === step.id ? activeStepRef : undefined}
                   onUpdateStep={onUpdateStep}
                   onDeleteStep={onDeleteStep}
+                  onStepBlur={onStepBlur}
                   canDelete={true}
                 />
               ))
@@ -339,6 +344,7 @@ export function TestCasesSidebar({ className }: { className?: string }) {
   const activeStepRef = useRef<HTMLDivElement>(null);
   const pausedRef = useRef(false);
   const resumeResolveRef = useRef<(() => void) | null>(null);
+  const stepSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /** Sync sidebar with monitor: scroll the currently running step into view. */
   useEffect(() => {
@@ -354,10 +360,11 @@ export function TestCasesSidebar({ className }: { className?: string }) {
 
   const mockCleanupRef = useRef<(() => void) | null>(null);
 
-  /** Cleans up the mock execution timers on unmount so we do not update state after the component is gone. */
+  /** Cleans up the mock execution timers and step-save debounce on unmount. */
   useEffect(() => {
     return () => {
       mockCleanupRef.current?.();
+      if (stepSaveTimeoutRef.current) clearTimeout(stepSaveTimeoutRef.current);
     };
   }, []);
 
@@ -459,10 +466,43 @@ export function TestCasesSidebar({ className }: { className?: string }) {
   };
 
   const handleSave = () => {
-    const store = getExecutionState();
-    saveTestCasesToStorage(store.testCases);
-    setSavedFeedback(true);
-    window.setTimeout(() => setSavedFeedback(false), 2000);
+    // Commit any in-progress title edit (blur triggers handleSaveTitle in the row)
+    (document.activeElement as HTMLElement | null)?.blur();
+    // Flush step-save debounce so pending step edits are not lost, then persist current store
+    if (stepSaveTimeoutRef.current) {
+      clearTimeout(stepSaveTimeoutRef.current);
+      stepSaveTimeoutRef.current = null;
+    }
+    window.setTimeout(() => {
+      saveTestCasesToStorage(getExecutionState().testCases);
+      setSavedFeedback(true);
+      window.setTimeout(() => setSavedFeedback(false), 2000);
+    }, 0);
+  };
+
+  /** Update test case and persist to storage when name (or other fields) change so edits survive refresh. */
+  const handleUpdateTestCase = (testCaseId: string, updates: Partial<TestCase>) => {
+    updateTestCase(testCaseId, updates);
+    saveTestCasesToStorage(getExecutionState().testCases);
+  };
+
+  /** Update step and persist to storage after a short debounce so step instruction edits (e.g. Apple → Boat) survive refresh and run. */
+  const handleUpdateStep = (testCaseId: string, stepId: string, updates: Partial<TestStep>) => {
+    updateStep(testCaseId, stepId, updates);
+    if (stepSaveTimeoutRef.current) clearTimeout(stepSaveTimeoutRef.current);
+    stepSaveTimeoutRef.current = setTimeout(() => {
+      saveTestCasesToStorage(getExecutionState().testCases);
+      stepSaveTimeoutRef.current = null;
+    }, 600);
+  };
+
+  /** When user leaves a step input (blur), persist immediately so Save and Play use the latest step text. */
+  const handleStepBlur = () => {
+    if (stepSaveTimeoutRef.current) {
+      clearTimeout(stepSaveTimeoutRef.current);
+      stepSaveTimeoutRef.current = null;
+    }
+    saveTestCasesToStorage(getExecutionState().testCases);
   };
 
   return (
@@ -507,12 +547,14 @@ export function TestCasesSidebar({ className }: { className?: string }) {
               type="button"
               onClick={handleSave}
               disabled={testCases.length === 0 || savedFeedback}
-            className={cn(
-              "shrink-0 rounded border border-border px-2 py-1 text-xs font-medium transition-colors",
-              "hover:bg-muted hover:border-foreground/30 disabled:opacity-50 disabled:pointer-events-none",
-              savedFeedback && "text-green-600 border-green-600/50"
-            )}
-            title="Save test cases to browser storage (persists after refresh)"
+              aria-label="Save test cases"
+              data-testid="save-test-cases"
+              className={cn(
+                "shrink-0 rounded border border-border px-2 py-1 text-xs font-medium transition-colors",
+                "hover:bg-muted hover:border-foreground/30 disabled:opacity-50 disabled:pointer-events-none",
+                savedFeedback && "text-green-600 border-green-600/50"
+              )}
+              title="Save test cases to browser storage (persists after refresh)"
             >
               {savedFeedback ? (
                 "Saved!"
@@ -551,10 +593,11 @@ export function TestCasesSidebar({ className }: { className?: string }) {
                 onPause={handlePause}
                 onResume={handleResume}
                 onToggleExpand={handleToggleExpand}
-                onUpdateStep={updateStep}
-                onUpdateTestCase={updateTestCase}
+                onUpdateStep={handleUpdateStep}
+                onUpdateTestCase={handleUpdateTestCase}
                 onAddStep={addStep}
                 onDeleteStep={deleteStep}
+                onStepBlur={handleStepBlur}
               />
             ))
           )}

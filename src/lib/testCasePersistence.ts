@@ -1,7 +1,31 @@
-import type { TestCase } from "@/types/execution";
+import type { TestCase, TestStep } from "@/types/execution";
 
 const STORAGE_KEY = "flowstate-test-cases";
 const STORAGE_KEY_BACKUP = "flowstate-test-cases-backup";
+
+function normalizeStep(s: unknown): TestStep | null {
+  const step = s as Record<string, unknown> | null;
+  if (!step || typeof step.id !== "string" || typeof step.instruction !== "string") return null;
+  return {
+    id: step.id,
+    instruction: step.instruction,
+    payload: (step.payload as TestStep["payload"]) ?? null,
+    status: (step.status as TestStep["status"]) ?? "idle",
+    order: typeof step.order === "number" ? step.order : 0,
+    healingAttempts: typeof step.healingAttempts === "number" ? step.healingAttempts : 0,
+    retryCount: typeof step.retryCount === "number" ? step.retryCount : 0,
+    ...(step.error !== undefined && { error: String(step.error) }),
+    ...(step.screenshot !== undefined && { screenshot: String(step.screenshot) }),
+    ...(step.expectedElement !== undefined && { expectedElement: String(step.expectedElement) }),
+    ...(step.actualPageContent !== undefined && { actualPageContent: String(step.actualPageContent) }),
+    ...(step.visualClick !== undefined && { visualClick: !!step.visualClick }),
+    ...(step.discoveryReason !== undefined && { discoveryReason: String(step.discoveryReason) }),
+    ...(step.validationPassed !== undefined && { validationPassed: !!step.validationPassed }),
+    ...(step.resolvedBy !== undefined && { resolvedBy: step.resolvedBy as TestStep["resolvedBy"] }),
+    ...(step.startedAt !== undefined && { startedAt: String(step.startedAt) }),
+    ...(step.completedAt !== undefined && { completedAt: String(step.completedAt) }),
+  };
+}
 
 function parseStoredCases(raw: string | null): TestCase[] | null {
   if (raw === null || raw === "") return null;
@@ -12,10 +36,13 @@ function parseStoredCases(raw: string | null): TestCase[] | null {
       const tc = item as Record<string, unknown>;
       if (!tc || typeof tc.id !== "string" || typeof tc.name !== "string" || !Array.isArray(tc.steps))
         return null;
+      const steps = (tc.steps as unknown[])
+        .map(normalizeStep)
+        .filter((step): step is TestStep => step !== null);
       return {
         id: tc.id,
         name: tc.name,
-        steps: tc.steps as TestCase["steps"],
+        steps,
         status: "queued" as const,
       } satisfies TestCase;
     });

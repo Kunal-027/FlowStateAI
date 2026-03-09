@@ -57,6 +57,41 @@ function TimelineRow({
             Self-healed
           </span>
         )}
+        {step.resolvedBy && (
+          <span
+            className="shrink-0 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-muted text-muted-foreground"
+            title={
+              step.resolvedBy === "interpreter"
+                ? "Step resolved by parser/semantic locator"
+                : step.resolvedBy === "huggingface"
+                  ? "Step resolved by Hugging Face LLM"
+                  : step.resolvedBy === "claude"
+                    ? "Step resolved by Claude (LLM)"
+                    : "Step resolved by Claude (Visual Discovery)"
+            }
+          >
+            {step.resolvedBy === "interpreter"
+              ? "Interpreter"
+              : step.resolvedBy === "huggingface"
+                ? "Hugging Face"
+                : step.resolvedBy === "claude"
+                  ? "Claude (LLM)"
+                  : "Claude (Visual)"}
+          </span>
+        )}
+        {step.visualClick && (
+          <span
+            className="shrink-0 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-emerald-500/20 text-emerald-700 dark:text-emerald-300"
+            title={step.discoveryReason ?? "Step succeeded via AI Visual Discovery (click by coordinates)"}
+          >
+            Visual Discovery
+          </span>
+        )}
+        {step.visualClick && step.validationPassed === false && (
+          <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Post-click validation did not detect page change">
+            (unverified)
+          </span>
+        )}
         <span className="min-w-0 flex-1 truncate font-medium">
           {step.order + 1}. {step.instruction}
         </span>
@@ -73,6 +108,13 @@ function TimelineRow({
               <span className="text-muted-foreground">Actual:</span>
               <span className="text-destructive">{step.error ?? "Step failed"}</span>
             </div>
+          )}
+          {step.visualClick && step.discoveryReason && (
+            <p className="text-xs text-muted-foreground">
+              <span className="font-medium">Visual Discovery:</span> {step.discoveryReason}
+              {step.validationPassed === true && " · Validation passed (page changed)"}
+              {step.validationPassed === false && " · Validation not confirmed"}
+            </p>
           )}
           {step.screenshot && (
             <div className={isFailed ? "pt-1" : ""}>

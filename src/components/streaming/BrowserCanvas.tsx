@@ -4,8 +4,11 @@ import { useRef, useEffect, useState } from "react";
 import { useExecutionStore, getExecutionState } from "@/store/useExecutionStore";
 import { cn } from "@/lib/utils";
 
-/** Bridge WebSocket URL (Express + ws server on port 4001). */
-const BRIDGE_WS_URL = "ws://localhost:4001";
+/** Bridge WebSocket URL (default port 4000; set NEXT_PUBLIC_BRIDGE_PORT or NEXT_PUBLIC_WS_STREAM_URL in env). */
+const BRIDGE_WS_URL =
+  typeof process.env.NEXT_PUBLIC_WS_STREAM_URL === "string" && process.env.NEXT_PUBLIC_WS_STREAM_URL
+    ? process.env.NEXT_PUBLIC_WS_STREAM_URL
+    : `ws://localhost:${process.env.NEXT_PUBLIC_BRIDGE_PORT || "4000"}`;
 
 const DEFAULT_START_URL = "https://www.google.com";
 
@@ -44,14 +47,17 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
   } | null>(null);
   const [connected, setConnected] = useState(false);
   const [navigationReady, setNavigationReady] = useState(false);
+  const [liveInteract, setLiveInteract] = useState(false);
 
   const testCases = useExecutionStore((s) => s.testCases);
+  const bridgeSend = useExecutionStore((s) => s.bridgeSend);
   const activeTestCaseId = useExecutionStore((s) => s.activeTestCaseId);
   const setStreamConnected = useExecutionStore((s) => s.setStreamConnected);
   const setStreamSession = useExecutionStore((s) => s.setStreamSession);
   const setBridgeSend = useExecutionStore((s) => s.setBridgeSend);
   const setExecuteStep = useExecutionStore((s) => s.setExecuteStep);
   const addLog = useExecutionStore((s) => s.addLog);
+  const clearLogs = useExecutionStore((s) => s.clearLogs);
   const updateTestCase = useExecutionStore((s) => s.updateTestCase);
 
   const activeCase = activeTestCaseId
@@ -143,9 +149,12 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
           sessionId?: string;
           /** From bridge step_done: true = step passed, false = e.g. verify_displayed failed */
           success?: boolean;
+          /** Which resolved this step: interpreter, huggingface, claude, visual_discovery */
+          resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
         };
 
         if (parsed.type === "session_started" && parsed.sessionId) {
+          clearLogs();
           setStreamSession(parsed.sessionId);
           setNavigationReady(false);
           return;
@@ -155,6 +164,8 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
           return;
         }
         if (parsed.type === "log" && typeof parsed.message === "string") {
+          const currentSessionId = getExecutionState().streamSessionId;
+          if (parsed.sessionId != null && currentSessionId != null && parsed.sessionId !== currentSessionId) return;
           addLog({
             level: (parsed.level === "error" || parsed.level === "warn" ? parsed.level : "info") as "info" | "warn" | "error",
             message: parsed.message,
@@ -174,12 +185,23 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
           const success = parsed.success !== false;
           const screenshot = parsed.screenshot ?? undefined;
           if (success) {
-            pendingStepRef.current?.resolve({ success: true, screenshot });
+            pendingStepRef.current?.resolve({
+              success: true,
+              screenshot,
+              selfHealed: !!parsed.selfHealed,
+              visualClick: !!parsed.visualClick,
+              discoveryReason: parsed.discoveryReason ?? undefined,
+              validationPassed: parsed.validationPassed,
+              resolvedBy: parsed.resolvedBy,
+            });
           } else {
             pendingStepRef.current?.reject({
               success: false,
               error: parsed.message ?? "Step failed",
               screenshot,
+              expectedElement: parsed.expectedElement,
+              actualPageContent: parsed.actualPageContent,
+              resolvedBy: parsed.resolvedBy,
             });
             pendingStepRef.current = null;
           }
@@ -195,6 +217,8 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
             success: false,
             error: msg,
             screenshot: parsed.screenshot ?? undefined,
+            expectedElement: parsed.expectedElement,
+            actualPageContent: parsed.actualPageContent,
           });
           pendingStepRef.current = null;
           return;
@@ -254,7 +278,7 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
       setStreamConnected(false);
       setStreamSession(null);
     };
-  }, [isRunning, setStreamConnected, setStreamSession, setBridgeSend, setExecuteStep, addLog, updateTestCase, activeTestCaseId]);
+  }, [isRunning, setStreamConnected, setStreamSession, setBridgeSend, setExecuteStep, addLog, clearLogs, updateTestCase, activeTestCaseId]);
 
   /** Resizes the canvas to match the container size (responsive to the Monitor div) using ResizeObserver. */
   useEffect(() => {
@@ -276,6 +300,41 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
     observer.observe(container);
     return () => observer.disconnect();
   }, []);
+
+  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!liveInteract || !bridgeSend) return;
+    const canvas = canvasRef.current;
+    if (!canvas || e.target !== canvas) return;
+    const x = e.nativeEvent.offsetX;
+    const y = e.nativeEvent.offsetY;
+    const canvasWidth = canvas.width || 1;
+    const canvasHeight = canvas.height || 1;
+    bridgeSend({
+      type: "interact",
+      action: "click",
+      x,
+      y,
+      canvasWidth,
+      canvasHeight,
+    });
+  };
+
+  /** Non-passive wheel listener so we can preventDefault and forward scroll to the bridge. */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!liveInteract || !bridgeSend || !canvas) return;
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      bridgeSend({
+        type: "interact",
+        action: "scroll",
+        deltaX: e.deltaX,
+        deltaY: e.deltaY,
+      });
+    };
+    canvas.addEventListener("wheel", handleWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", handleWheel);
+  }, [liveInteract, bridgeSend]);
 
   /** When the WebSocket is disconnected, draws the fallback state: dark background and "Waiting for browser connection...". */
   useEffect(() => {
@@ -310,7 +369,7 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-[#0d0d0d] px-4 text-center">
           <p className="text-muted-foreground text-sm">Waiting for browser connection…</p>
           <p className="text-muted-foreground/80 text-xs max-w-sm">
-            Start the bridge so the monitor can stream the browser: run <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">node bridge/server.js</code> in the project root (port 4001).
+            Start the bridge so the monitor can stream the browser: run <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">node bridge/server.js</code> or <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">npm run bridge</code> in the project root (port 4000).
           </p>
         </div>
       )}
@@ -319,16 +378,45 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
           <p className="text-muted-foreground text-sm">Loading…</p>
         </div>
       )}
-      {connected && !isRunning && (
+      {connected && !isRunning && !liveInteract && (
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black/60 px-4 text-center">
           <p className="text-muted-foreground text-sm">Test ended.</p>
           <p className="text-muted-foreground/80 text-xs">Run another test to reconnect the browser.</p>
         </div>
       )}
+      {connected && (
+        <div className="absolute bottom-2 right-2 z-20 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setLiveInteract((v) => !v)}
+            className={cn(
+              "rounded px-2 py-1 text-xs font-medium transition-colors",
+              liveInteract
+                ? "bg-emerald-600 text-white hover:bg-emerald-500"
+                : "bg-muted/80 text-muted-foreground hover:bg-muted"
+            )}
+          >
+            {liveInteract ? "Interact on" : "Interact"}
+          </button>
+          {liveInteract && (
+            <>
+              <span className="text-[10px] text-muted-foreground max-w-[120px]">Click or scroll on screen</span>
+              <button
+                type="button"
+                onClick={() => bridgeSend?.({ type: "interact", action: "key", key: "Enter" })}
+                className="rounded px-2 py-1 text-xs font-medium bg-muted/80 text-muted-foreground hover:bg-muted"
+              >
+                Send Enter
+              </button>
+            </>
+          )}
+        </div>
+      )}
       <canvas
         ref={canvasRef}
-        className="block w-full h-full object-fill"
+        className={cn("block w-full h-full object-fill", liveInteract && "cursor-pointer")}
         style={{ width: "100%", height: "100%", display: "block" }}
+        onClick={handleCanvasClick}
       />
     </div>
   );

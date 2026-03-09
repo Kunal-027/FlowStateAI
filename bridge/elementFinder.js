@@ -59,18 +59,45 @@ function fieldScore(fieldValue, query) {
 /**
  * Global aliases: minimal set of common terms so any app works without site-specific config.
  * Used only to expand variants; primary matching is by query + words (see below).
+ * Keep this small—design for millions of products/words via patterns and variants, not enum growth.
  */
 const GLOBAL_FILL_ALIASES = {
   username: ["email", "login", "user", "phone"],
   email: ["username", "login", "user"],
   password: ["pass", "pwd"],
   search: ["q", "query", "search box"],
+  gym: ["search gym", "gym search"],
 };
 const GLOBAL_CLICK_ALIASES = {
   login: ["sign in", "log in", "submit", "signin"],
   submit: ["login", "sign in", "log in"],
   go: ["submit", "search button"],
+  save: ["save for later", "save item", "save changes", "save and close"],
 };
+
+/** Common typos so automation finds the right element (e.g. "Comapnies" → "Companies"). */
+const COMMON_TYPO_CORRECTIONS = {
+  comapnies: "companies",
+  compaines: "companies",
+  companys: "companies",
+  settigns: "settings",
+  setings: "settings",
+  dashbord: "dashboard",
+  dashborad: "dashboard",
+  sucess: "success",
+  succes: "success",
+  sucessful: "successful",
+  logn: "login",
+  sigin: "sign in",
+  sigout: "sign out",
+  serach: "search",
+  serch: "search",
+  sve: "save",
+  sav: "save",
+};
+
+/** Generic words we must not match on alone for click/hover when query has other words (avoids "Companies Menu" matching random "Menu"). */
+const GENERIC_CLICK_WORDS = new Set(["menu", "button", "link", "tab", "item", "dropdown", "icon", "option"]);
 
 /**
  * Returns variants for fuzzy matching: query, its words, and optional global aliases.
@@ -86,6 +113,17 @@ function getQueryVariants(query, action) {
   const words = toWords(query).filter((w) => w.length > 1);
   const list = [q, ...words];
 
+  // Add corrected spellings so "Comapnies Menu" matches "Companies" in the DOM.
+  for (const word of words) {
+    const corrected = COMMON_TYPO_CORRECTIONS[word];
+    if (corrected && corrected !== word) list.push(corrected);
+  }
+  const correctedPhrase = q
+    .split(/\s+/)
+    .map((w) => COMMON_TYPO_CORRECTIONS[w] || w)
+    .join(" ");
+  if (correctedPhrase !== q) list.push(correctedPhrase);
+
   if (action === "fill" || action === "type") {
     for (const [key, vals] of Object.entries(GLOBAL_FILL_ALIASES)) {
       if (key === q || vals.includes(q) || words.includes(key)) {
@@ -100,6 +138,10 @@ function getQueryVariants(query, action) {
         list.push(key, ...vals);
         break;
       }
+    }
+    // When query has multiple words, do not use generic words as standalone variants (avoids clicking wrong "Menu" for "Companies Menu").
+    if (words.length >= 2) {
+      list = list.filter((v) => !GENERIC_CLICK_WORDS.has((v || "").trim().toLowerCase()));
     }
   }
   return [...new Set(list)];
@@ -250,4 +292,14 @@ function findBestSelector(snapshot, query, action) {
   return candidates[0].selector;
 }
 
-module.exports = { findCandidates, findBestSelector };
+/** Returns typo-corrected string for click/hover targets (e.g. "Comapnies Menu" → "Companies Menu"). */
+function getTypoCorrectedTarget(text) {
+  if (!text || typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const words = trimmed.split(/\s+/);
+  const corrected = words.map((w) => COMMON_TYPO_CORRECTIONS[w.toLowerCase()] || w).join(" ");
+  return corrected !== trimmed ? corrected : null;
+}
+
+module.exports = { findCandidates, findBestSelector, getTypoCorrectedTarget };

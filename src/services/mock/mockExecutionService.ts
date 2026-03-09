@@ -7,7 +7,7 @@ export interface MockExecutionActions {
   /** Set the currently running step id (null when idle or between steps). Used to sync sidebar and monitor. */
   setActiveStep?: (id: string | null) => void;
   /** Update a step's status (and optional error/screenshot for reporting). */
-  updateStep?: (testCaseId: string, stepId: string, updates: Partial<Pick<TestStep, "status" | "error" | "screenshot">>) => void;
+  updateStep?: (testCaseId: string, stepId: string, updates: Partial<Pick<TestStep, "status" | "error" | "screenshot" | "expectedElement" | "actualPageContent" | "healingAttempts" | "visualClick" | "discoveryReason" | "validationPassed" | "resolvedBy">>) => void;
 }
 
 /** Result of executing a step via the bridge (step_done / error / ambiguity_error). */
@@ -15,6 +15,17 @@ export interface StepResult {
   success: boolean;
   error?: string;
   screenshot?: string;
+  selfHealed?: boolean;
+  /** True when step succeeded via AI Visual Discovery. */
+  visualClick?: boolean;
+  /** AI reason (for Visual Discovery hit-rate monitoring). */
+  discoveryReason?: string;
+  /** True when post-click validation passed (e.g. URL changed). */
+  validationPassed?: boolean;
+  /** Which resolved this step: interpreter, huggingface, claude, visual_discovery. */
+  resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
+  expectedElement?: string;
+  actualPageContent?: string;
 }
 
 /** Bridge step message: action + optional target (fuzzy-resolved), value, url, etc. */
@@ -173,9 +184,17 @@ export function startMockExecution(
               status: result.success ? "success" : "failed",
               ...(result.success ? {} : { error: result.error }),
               screenshot: result.screenshot,
+              ...(result.expectedElement != null ? { expectedElement: result.expectedElement } : {}),
+              ...(result.actualPageContent != null ? { actualPageContent: result.actualPageContent } : {}),
+              ...(result.selfHealed ? { healingAttempts: 1 } : {}),
+              ...(result.visualClick ? { visualClick: true } : {}),
+              ...(result.discoveryReason != null ? { discoveryReason: result.discoveryReason } : {}),
+              ...(result.validationPassed != null ? { validationPassed: result.validationPassed } : {}),
+              ...(result.resolvedBy != null ? { resolvedBy: result.resolvedBy } : {}),
             });
             if (!result.success) {
-              actions.updateTestCase(testCaseId, { status: "failed", error: result.error, completedAt: new Date().toISOString() });
+              const errorWithStep = step.instruction ? `${step.instruction}: ${result.error ?? "Step failed."}` : (result.error ?? "Step failed.");
+              actions.updateTestCase(testCaseId, { status: "failed", error: errorWithStep, completedAt: new Date().toISOString() });
               setActiveStep?.(null);
               onRunComplete?.(testCaseId);
               notifyTestEnd(false);
@@ -192,12 +211,16 @@ export function startMockExecution(
           } catch (err) {
             const res = err && typeof err === "object" && "error" in err ? (err as StepResult) : null;
             const message = res ? String(res.error) : String(err);
+            const errorWithStep = step.instruction ? `${step.instruction}: ${message}` : message;
             updateStep?.(testCaseId, step.id, {
               status: "failed",
               error: message,
               ...(res?.screenshot ? { screenshot: res.screenshot } : {}),
+              ...(res?.expectedElement != null ? { expectedElement: res.expectedElement } : {}),
+              ...(res?.actualPageContent != null ? { actualPageContent: res.actualPageContent } : {}),
+              ...(res?.resolvedBy != null ? { resolvedBy: res.resolvedBy } : {}),
             });
-            actions.updateTestCase(testCaseId, { status: "failed", error: message, completedAt: new Date().toISOString() });
+            actions.updateTestCase(testCaseId, { status: "failed", error: errorWithStep, completedAt: new Date().toISOString() });
             setActiveStep?.(null);
             onRunComplete?.(testCaseId);
             notifyTestEnd(false);
@@ -220,7 +243,7 @@ export function startMockExecution(
     if (steps.length > 0) {
       actions.addLog({
         level: "info",
-        message: "Bridge not connected. Start the bridge (port 4001) to run tests in the browser.",
+        message: "Bridge not connected. Start the bridge (port 4000) to run tests in the browser.",
         testCaseId,
       });
       mockTimeout = setTimeout(() => {
@@ -231,7 +254,7 @@ export function startMockExecution(
     } else {
       actions.addLog({
         level: "info",
-        message: "Bridge not connected. Start the bridge (port 4001) to run tests.",
+        message: "Bridge not connected. Start the bridge (port 4000) to run tests.",
         testCaseId,
       });
       mockTimeout = setTimeout(() => {

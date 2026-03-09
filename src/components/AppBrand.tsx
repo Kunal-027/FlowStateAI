@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { cn } from "@/lib/utils";
 
 /** FlowState AI logo mark: play + flow lines. */
@@ -32,20 +33,16 @@ function LogoIcon({ className }: { className?: string }) {
 export interface AppBrandProps {
   className?: string;
   compact?: boolean;
+  /** When set, logo and name link to this URL (e.g. "/" for home). */
+  href?: string;
 }
 
 /**
- * App name and logo for corners. Use compact in tight spaces.
+ * App name and logo for corners. Use compact in tight spaces. Pass href (e.g. "/") to make it clickable to home.
  */
-export function AppBrand({ className, compact }: AppBrandProps) {
-  return (
-    <div
-      className={cn(
-        "flex items-center gap-2 shrink-0",
-        compact ? "gap-1.5" : "gap-2",
-        className
-      )}
-    >
+export function AppBrand({ className, compact, href }: AppBrandProps) {
+  const content = (
+    <>
       <LogoIcon className={compact ? "h-6 w-6" : "h-8 w-8"} />
       <span
         className={cn(
@@ -55,6 +52,20 @@ export function AppBrand({ className, compact }: AppBrandProps) {
       >
         FlowState AI
       </span>
-    </div>
+    </>
   );
+  const wrapperClass = cn(
+    "flex items-center gap-2 shrink-0",
+    compact ? "gap-1.5" : "gap-2",
+    href && "hover:opacity-90 transition-opacity",
+    className
+  );
+  if (href) {
+    return (
+      <Link href={href} className={wrapperClass} aria-label="Go to home">
+        {content}
+      </Link>
+    );
+  }
+  return <div className={wrapperClass}>{content}</div>;
 }
