@@ -58,6 +58,8 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
   const setExecuteStep = useExecutionStore((s) => s.setExecuteStep);
   const addLog = useExecutionStore((s) => s.addLog);
   const clearLogs = useExecutionStore((s) => s.clearLogs);
+  const clearPageScreenshots = useExecutionStore((s) => s.clearPageScreenshots);
+  const addPageScreenshot = useExecutionStore((s) => s.addPageScreenshot);
   const updateTestCase = useExecutionStore((s) => s.updateTestCase);
 
   const activeCase = activeTestCaseId
@@ -151,12 +153,21 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
           success?: boolean;
           /** Which resolved this step: interpreter, huggingface, claude, visual_discovery */
           resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
+          cacheHit?: boolean;
+          aiHeal?: boolean;
+          /** 'selector' = element not found (fixable via AI); 'functional' = verify failed / real bug */
+          failureType?: "selector" | "functional";
         };
 
         if (parsed.type === "session_started" && parsed.sessionId) {
           clearLogs();
+          clearPageScreenshots();
           setStreamSession(parsed.sessionId);
           setNavigationReady(false);
+          return;
+        }
+        if (parsed.type === "page_screenshot" && typeof parsed.url === "string" && typeof parsed.screenshot === "string") {
+          addPageScreenshot({ url: parsed.url, screenshot: parsed.screenshot });
           return;
         }
         if (parsed.type === "navigation_done") {
@@ -193,6 +204,8 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
               discoveryReason: parsed.discoveryReason ?? undefined,
               validationPassed: parsed.validationPassed,
               resolvedBy: parsed.resolvedBy,
+              cacheHit: !!parsed.cacheHit,
+              aiHeal: !!parsed.aiHeal,
             });
           } else {
             pendingStepRef.current?.reject({
@@ -202,6 +215,7 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
               expectedElement: parsed.expectedElement,
               actualPageContent: parsed.actualPageContent,
               resolvedBy: parsed.resolvedBy,
+              failureType: parsed.failureType,
             });
             pendingStepRef.current = null;
           }
@@ -278,7 +292,7 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
       setStreamConnected(false);
       setStreamSession(null);
     };
-  }, [isRunning, setStreamConnected, setStreamSession, setBridgeSend, setExecuteStep, addLog, clearLogs, updateTestCase, activeTestCaseId]);
+  }, [isRunning, setStreamConnected, setStreamSession, setBridgeSend, setExecuteStep, addLog, clearLogs, clearPageScreenshots, addPageScreenshot, updateTestCase, activeTestCaseId]);
 
   /** Resizes the canvas to match the container size (responsive to the Monitor div) using ResizeObserver. */
   useEffect(() => {

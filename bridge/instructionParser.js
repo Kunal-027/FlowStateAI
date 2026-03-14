@@ -119,7 +119,7 @@ function parseInstructionDynamically(instruction) {
 
   // ─── 2. Navigate ─────────────────────────────────────────────────────────
   if (startsWithVerb(s, "navigate")) {
-    const url = s.replace(/^(?:navigate to|go to|open|visit)\s+/i, "").trim();
+    const url = s.replace(/^(?:navigate(?:\s+to)?|go\s+to|open|visit)\s+/i, "").trim();
     if (url) return { action: "navigate", target: url, value: url };
   }
 
@@ -145,6 +145,14 @@ function parseInstructionDynamically(instruction) {
   const fillDash = s.match(/^(?:enter|type)\s+(.+?)\s+-\s+(.+)$/i);
   if (fillDash) return { action: "fill", target: fillDash[2].trim(), value: trimQuotes(fillDash[1].trim()) };
 
+  // "Enter username X" / "Enter password X" (with or without quotes) — explicit login fields
+  const enterUsernameOrPassword = s.match(/^(?:enter|type|fill)\s+(username|password|user|email|e-?mail|pass)\s+["']?([^"']+)["']?\s*$/i);
+  if (enterUsernameOrPassword) {
+    const raw = enterUsernameOrPassword[1].toLowerCase().replace(/e-?mail/, "email");
+    const target = raw === "user" ? "username" : raw === "pass" ? "password" : raw;
+    return { action: "fill", target, value: enterUsernameOrPassword[2].trim() };
+  }
+
   // "Enter/Type 'value'" (target hint from context)
   const fillQuoted = s.match(/^(?:enter|type)\s+(.+?)\s+["']([^"']+)["']\s*$/i);
   if (fillQuoted) return { action: "fill", target: fillQuoted[1].trim(), value: fillQuoted[2].trim() };
@@ -157,9 +165,12 @@ function parseInstructionDynamically(instruction) {
   const searchGym = s.match(/^search\s+(?:for\s+)?(?:gym|Gym)\s+(.+)$/i);
   if (searchGym) return { action: "fill", target: "gym", value: trimQuotes(searchGym[1].trim()) };
 
-  // "Search [for] X" → fill search with X ("Search Nike Shoes" → target=search, value=Nike Shoes)
+  // "Search [for] X" → fill search with X ("Search Nike Shoes" → target=search, value=Nike Shoes; "Search for X" → value=X)
   const searchSingle = s.match(/^search\s+(?:for\s+)?(.+)$/i);
-  if (searchSingle) return { action: "fill", target: "search", value: searchSingle[1].trim() };
+  if (searchSingle) {
+    const value = searchSingle[1].trim().replace(/^for\s+/i, "").trim();
+    if (value) return { action: "fill", target: "search", value };
+  }
 
   // Generic fill: "Enter/Type <rest>" (two+ tokens: last = value, rest = target hint)
   if (startsWithVerb(s, "fill")) {
@@ -199,8 +210,40 @@ function parseInstructionDynamically(instruction) {
   return null;
 }
 
+/** ActionSchema: standardized shape for execution (ActionType, Target, Value). Cached so we don't re-parse the same instruction twice. */
+const INTENT_CACHE_MAX = 500;
+const intentCache = new Map();
+
+/**
+ * Returns a stable key for the instruction (normalize so equivalent phrasings hit the same cache).
+ */
+function intentCacheKey(instruction) {
+  if (!instruction || typeof instruction !== "string") return "";
+  return instruction.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * Compile raw user input into a standardized ActionSchema (actionType, target, value).
+ * Cached per instruction so we don't re-parse the same instruction twice (token economy, speed).
+ * @param {string} instruction - Raw step instruction (e.g. "Search Nike Shoes", "Click Login").
+ * @returns {{ action: string, target?: string, value?: string } | null} ActionSchema or null.
+ */
+function getCompiledActionSchema(instruction) {
+  const key = intentCacheKey(instruction);
+  if (!key) return null;
+  if (intentCache.has(key)) return intentCache.get(key);
+  const parsed = parseInstructionDynamically(instruction);
+  if (intentCache.size >= INTENT_CACHE_MAX) {
+    const firstKey = intentCache.keys().next().value;
+    if (firstKey != null) intentCache.delete(firstKey);
+  }
+  intentCache.set(key, parsed);
+  return parsed;
+}
+
 module.exports = {
   parseInstructionDynamically,
+  getCompiledActionSchema,
   ACTIONS,
   VERBS,
   extractClickTarget,

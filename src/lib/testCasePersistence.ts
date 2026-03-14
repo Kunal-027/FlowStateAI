@@ -22,6 +22,9 @@ function normalizeStep(s: unknown): TestStep | null {
     ...(step.discoveryReason !== undefined && { discoveryReason: String(step.discoveryReason) }),
     ...(step.validationPassed !== undefined && { validationPassed: !!step.validationPassed }),
     ...(step.resolvedBy !== undefined && { resolvedBy: step.resolvedBy as TestStep["resolvedBy"] }),
+    ...(step.cacheHit !== undefined && { cacheHit: !!step.cacheHit }),
+    ...(step.aiHeal !== undefined && { aiHeal: !!step.aiHeal }),
+    ...(step.failureType !== undefined && { failureType: step.failureType }),
     ...(step.startedAt !== undefined && { startedAt: String(step.startedAt) }),
     ...(step.completedAt !== undefined && { completedAt: String(step.completedAt) }),
   };

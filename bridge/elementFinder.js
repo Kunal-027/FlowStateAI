@@ -292,6 +292,80 @@ function findBestSelector(snapshot, query, action) {
   return candidates[0].selector;
 }
 
+/**
+ * Max raw score from scoreEntry (approx) for normalizing to 0–1. Introspection uses 90% threshold.
+ */
+const MAX_RAW_SCORE_ESTIMATE = 2.5;
+
+/**
+ * Returns the best-matching selector with normalized score and reasoning for reporting.
+ * Used by the introspection layer: if normalizedScore >= 0.9, skip Claude.
+ * @param {Array} snapshot - DOM snapshot from getDomSnapshotInPage (introspection map).
+ * @param {string} query - User intent (e.g. "Log in", "username").
+ * @param {string} [action] - "fill" | "type" | "click" | "hover".
+ * @returns {{ selector: string | null, normalizedScore: number, reasoning: string }}
+ */
+function findBestSelectorWithScore(snapshot, query, action) {
+  let candidates = findCandidates(snapshot, query, action);
+  if (candidates.length === 0) {
+    if (action === "fill" || action === "type") {
+      const editableInputTypes = new Set(["text", "search", "email", "tel", "url", "password", ""]);
+      const fillable = snapshot.filter((e) => {
+        if (e.tagName === "textarea") return true;
+        if (e.tagName !== "input") return false;
+        return editableInputTypes.has((e.type || "").toLowerCase());
+      });
+      const textLike = fillable.filter((e) => {
+        const type = (e.type || "").toLowerCase();
+        return ["text", "email", "tel", "", "search"].includes(type);
+      });
+      if (textLike.length >= 1) {
+        const entry = textLike[0];
+        const semantic = [entry.placeholder, entry.ariaLabel, entry.name, entry.text].filter(Boolean).join(" ").trim() || entry.selector;
+        return {
+          selector: entry.selector,
+          normalizedScore: 0.5,
+          reasoning: `Fallback to first text-like input (no strong match for "${query}"): ${semantic || "input"}`,
+        };
+      }
+    }
+    return { selector: null, normalizedScore: 0, reasoning: `Introspection map had no match for intent "${query}".` };
+  }
+  if (action === "click" || action === "hover") {
+    const nq = normalize(query);
+    const qWords = nq.split(/\s+/).filter(Boolean);
+    if (qWords.length >= 2) {
+      const phraseCandidates = candidates.filter((c) => {
+        const entry = snapshot.find((e) => e.selector === c.selector);
+        const text = normalize((entry && (entry.text || entry.ariaLabel)) || "");
+        return text.includes(nq);
+      });
+      if (phraseCandidates.length > 0) candidates = phraseCandidates;
+      candidates = [...candidates].sort((a, b) => {
+        const entryA = snapshot.find((e) => e.selector === a.selector);
+        const entryB = snapshot.find((e) => e.selector === b.selector);
+        const textA = normalize((entryA && (entryA.text || entryA.ariaLabel)) || "");
+        const textB = normalize((entryB && (entryB.text || entryB.ariaLabel)) || "");
+        const phraseA = textA.includes(nq);
+        const phraseB = textB.includes(nq);
+        if (phraseA && !phraseB) return -1;
+        if (!phraseA && phraseB) return 1;
+        return b.score - a.score;
+      });
+    }
+  }
+  const best = candidates[0];
+  const entry = snapshot.find((e) => e.selector === best.selector);
+  const semanticLabel = [entry?.text, entry?.ariaLabel, entry?.placeholder, entry?.name].filter(Boolean).join(" ").trim() || best.selector;
+  const normalizedScore = Math.min(1, best.score / MAX_RAW_SCORE_ESTIMATE);
+  const reasoning = `Matched intent "${query}" to element (${best.matchHint || "label"}): "${semanticLabel.slice(0, 80)}" (score ${normalizedScore.toFixed(2)})`;
+  return {
+    selector: best.selector,
+    normalizedScore,
+    reasoning,
+  };
+}
+
 /** Returns typo-corrected string for click/hover targets (e.g. "Comapnies Menu" → "Companies Menu"). */
 function getTypoCorrectedTarget(text) {
   if (!text || typeof text !== "string") return null;
@@ -302,4 +376,4 @@ function getTypoCorrectedTarget(text) {
   return corrected !== trimmed ? corrected : null;
 }
 
-module.exports = { findCandidates, findBestSelector, getTypoCorrectedTarget };
+module.exports = { findCandidates, findBestSelector, findBestSelectorWithScore, getTypoCorrectedTarget };

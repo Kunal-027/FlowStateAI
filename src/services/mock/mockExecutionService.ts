@@ -7,7 +7,7 @@ export interface MockExecutionActions {
   /** Set the currently running step id (null when idle or between steps). Used to sync sidebar and monitor. */
   setActiveStep?: (id: string | null) => void;
   /** Update a step's status (and optional error/screenshot for reporting). */
-  updateStep?: (testCaseId: string, stepId: string, updates: Partial<Pick<TestStep, "status" | "error" | "screenshot" | "expectedElement" | "actualPageContent" | "healingAttempts" | "visualClick" | "discoveryReason" | "validationPassed" | "resolvedBy">>) => void;
+  updateStep?: (testCaseId: string, stepId: string, updates: Partial<Pick<TestStep, "status" | "error" | "screenshot" | "expectedElement" | "actualPageContent" | "healingAttempts" | "visualClick" | "discoveryReason" | "validationPassed" | "resolvedBy" | "cacheHit" | "aiHeal" | "failureType">>) => void;
 }
 
 /** Result of executing a step via the bridge (step_done / error / ambiguity_error). */
@@ -26,6 +26,12 @@ export interface StepResult {
   resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
   expectedElement?: string;
   actualPageContent?: string;
+  /** True when step succeeded using Success Map cached selector (no AI). */
+  cacheHit?: boolean;
+  /** True when step succeeded after semantic discovery healed a failed cached selector. */
+  aiHeal?: boolean;
+  /** 'selector' = element not found (fixable via AI); 'functional' = verify failed / real bug */
+  failureType?: "selector" | "functional";
 }
 
 /** Bridge step message: action + optional target (fuzzy-resolved), value, url, etc. */
@@ -180,6 +186,7 @@ export function startMockExecution(
           const stepMsg = { ...toStepMessage(step), instruction: step.instruction };
           try {
             const result = await executeStep(stepMsg);
+            if (cancelled) return;
             updateStep?.(testCaseId, step.id, {
               status: result.success ? "success" : "failed",
               ...(result.success ? {} : { error: result.error }),
@@ -191,6 +198,9 @@ export function startMockExecution(
               ...(result.discoveryReason != null ? { discoveryReason: result.discoveryReason } : {}),
               ...(result.validationPassed != null ? { validationPassed: result.validationPassed } : {}),
               ...(result.resolvedBy != null ? { resolvedBy: result.resolvedBy } : {}),
+              ...(result.cacheHit ? { cacheHit: true } : {}),
+              ...(result.aiHeal ? { aiHeal: true } : {}),
+              ...(result.failureType != null ? { failureType: result.failureType } : {}),
             });
             if (!result.success) {
               const errorWithStep = step.instruction ? `${step.instruction}: ${result.error ?? "Step failed."}` : (result.error ?? "Step failed.");
@@ -209,6 +219,7 @@ export function startMockExecution(
               if (cancelled) return;
             }
           } catch (err) {
+            if (cancelled) return;
             const res = err && typeof err === "object" && "error" in err ? (err as StepResult) : null;
             const message = res ? String(res.error) : String(err);
             const errorWithStep = step.instruction ? `${step.instruction}: ${message}` : message;
@@ -219,6 +230,7 @@ export function startMockExecution(
               ...(res?.expectedElement != null ? { expectedElement: res.expectedElement } : {}),
               ...(res?.actualPageContent != null ? { actualPageContent: res.actualPageContent } : {}),
               ...(res?.resolvedBy != null ? { resolvedBy: res.resolvedBy } : {}),
+              ...(res?.failureType != null ? { failureType: res.failureType } : {}),
             });
             actions.updateTestCase(testCaseId, { status: "failed", error: errorWithStep, completedAt: new Date().toISOString() });
             setActiveStep?.(null);

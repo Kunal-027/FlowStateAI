@@ -56,6 +56,12 @@ export interface TestStep {
   validationPassed?: boolean;
   /** Which resolved this step: interpreter, huggingface, claude, or visual_discovery. */
   resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
+  /** True when step succeeded using Success Map cached selector (no AI). */
+  cacheHit?: boolean;
+  /** True when step succeeded after semantic discovery healed a failed cached selector. */
+  aiHeal?: boolean;
+  /** For failed steps: 'selector' = element not found (fixable via AI); 'functional' = verify failed / real bug */
+  failureType?: "selector" | "functional";
   /** Timestamps for reporting */
   startedAt?: string;
   completedAt?: string;
@@ -137,6 +143,12 @@ export interface ReportStep {
   validationPassed?: boolean;
   /** Which resolved this step: interpreter, huggingface, claude, or visual_discovery. */
   resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
+  /** True when step succeeded using Success Map cached selector (no AI). */
+  cacheHit?: boolean;
+  /** True when step succeeded after semantic discovery healed a failed cached selector. */
+  aiHeal?: boolean;
+  /** For failed steps: 'selector' = element not found (fixable via AI); 'functional' = verify failed / real bug. */
+  failureType?: "selector" | "functional";
   /** For failed steps: expected element (e.g. instruction) for HTML report. */
   expectedElement?: string;
   /** For failed steps: actual page content snippet for HTML report. */

@@ -14,6 +14,8 @@ export function ReportDetailView({ report }: { report: RunReport }) {
   const [search, setSearch] = useState("");
   const pass = report.steps.filter((s) => s.status === "success").length;
   const fail = report.steps.filter((s) => s.status === "failed").length;
+  const cacheHits = report.steps.filter((s) => s.cacheHit).length;
+  const aiHeals = report.steps.filter((s) => s.aiHeal).length;
   const duration = formatDuration(durationMs(report.startedAt, report.completedAt));
 
   const handleExport = () => {
@@ -65,6 +67,13 @@ export function ReportDetailView({ report }: { report: RunReport }) {
               {report.status === "success" ? "Passed" : "Failed"}
             </span>
           </p>
+          {(cacheHits > 0 || aiHeals > 0) && (
+            <p className="text-muted-foreground mt-1">
+              Cache hits: <span className="font-medium text-teal-600 dark:text-teal-400">{cacheHits}</span>
+              {" · "}
+              AI heals: <span className="font-medium text-amber-600 dark:text-amber-400">{aiHeals}</span>
+            </p>
+          )}
         </div>
       </div>
 

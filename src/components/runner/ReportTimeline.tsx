@@ -87,6 +87,30 @@ function TimelineRow({
             Visual Discovery
           </span>
         )}
+        {step.discoveryReason && !step.visualClick && (
+          <span
+            className="shrink-0 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-sky-500/20 text-sky-700 dark:text-sky-300"
+            title={step.discoveryReason}
+          >
+            Matched
+          </span>
+        )}
+        {step.cacheHit && (
+          <span
+            className="shrink-0 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-teal-500/20 text-teal-700 dark:text-teal-300"
+            title="Step succeeded using Success Map cached selector (no AI)"
+          >
+            Cache Hit
+          </span>
+        )}
+        {step.aiHeal && (
+          <span
+            className="shrink-0 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/20 text-amber-700 dark:text-amber-300"
+            title="Step succeeded after semantic discovery healed failed cached selector"
+          >
+            AI Heal
+          </span>
+        )}
         {step.visualClick && step.validationPassed === false && (
           <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title="Post-click validation did not detect page change">
             (unverified)
@@ -103,6 +127,13 @@ function TimelineRow({
         <div className="border-t border-border/80 bg-muted/30 px-3 py-2 space-y-2">
           {isFailed && (step.error != null || step.instruction) && (
             <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+              {step.failureType && (
+                <span className="col-span-2 text-muted-foreground">
+                  {step.failureType === "selector"
+                    ? "Selector failure (element not found — fixable via AI heal)"
+                    : "Functional failure (e.g. verify failed — possible product bug)"}
+                </span>
+              )}
               <span className="text-muted-foreground">Expected:</span>
               <span className="text-foreground">{step.instruction}</span>
               <span className="text-muted-foreground">Actual:</span>
@@ -114,6 +145,11 @@ function TimelineRow({
               <span className="font-medium">Visual Discovery:</span> {step.discoveryReason}
               {step.validationPassed === true && " · Validation passed (page changed)"}
               {step.validationPassed === false && " · Validation not confirmed"}
+            </p>
+          )}
+          {step.discoveryReason && !step.visualClick && (
+            <p className="text-xs text-muted-foreground">
+              <span className="font-medium">Reasoning:</span> {step.discoveryReason}
             </p>
           )}
           {step.screenshot && (
@@ -149,11 +185,20 @@ export function ReportTimeline({
   const filtered = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return steps;
-    return steps.filter(
-      (s) =>
-        s.instruction.toLowerCase().includes(q) ||
-        (s.error && s.error.toLowerCase().includes(q))
-    );
+    return steps.filter((s) => {
+      const instr = (s.instruction ?? "").toLowerCase();
+      const err = (s.error ?? "").toLowerCase();
+      const expected = (s.expectedElement ?? "").toLowerCase();
+      const actual = (s.actualPageContent ?? "").toLowerCase();
+      const stepNum = String((s.order ?? 0) + 1);
+      return (
+        instr.includes(q) ||
+        err.includes(q) ||
+        expected.includes(q) ||
+        actual.includes(q) ||
+        stepNum === q
+      );
+    });
   }, [steps, searchQuery]);
 
   return (

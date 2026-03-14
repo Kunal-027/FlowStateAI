@@ -1,11 +1,10 @@
 /**
- * AI-assisted selector healing: when exact + fuzzy fail, ask LLM for a CSS selector from DOM.
- * Uses HuggingFace first (cheaper), then Claude. Strict JSON-only output to save tokens.
+ * AI-assisted selector healing: when exact + fuzzy fail, ask Claude for a CSS selector from DOM.
+ * Claude only (ANTHROPIC_API_KEY). Strict JSON-only output to save tokens.
  */
 
 const path = require("path");
 const fs = require("fs");
-const { InferenceClient } = require("@huggingface/inference");
 const Anthropic = require("@anthropic-ai/sdk").default ?? require("@anthropic-ai/sdk");
 const { domSanitizer } = require("./domSanitizer");
 
@@ -61,12 +60,17 @@ function setCachedSelector(instruction, action, pageUrl, selector) {
   saveCache(cache);
 }
 
-const HF_MODEL = process.env.HF_MODEL || "Qwen/Qwen2.5-72B-Instruct";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-20241022";
+/** Haiku for simple selector repairs (token economy); Sonnet for complex reasoning. */
+const ANTHROPIC_MODEL_HAIKU = process.env.ANTHROPIC_MODEL_HAIKU || "claude-3-5-haiku-20241022";
 
 /** System prompt: return ONLY valid JSON to minimize output tokens. */
 const HEAL_SYSTEM_PROMPT = `You are a selector finder for browser automation. Given the user's goal and a DOM snippet, return a single CSS selector that targets the best matching element (button, link, input, etc.). Return ONLY valid JSON. No markdown, no code fences, no explanation.
 Format: {"selector": "css selector string"} if found, or {"selector": null, "reason": "brief reason"} if not found.`;
+
+/** For a11y + image: use accessibility tree (and optional screenshot) to find the element. */
+const HEAL_A11Y_SYSTEM_PROMPT = `You are a selector finder for browser automation. You will receive the user's goal and a compact Accessibility Tree (role, name, selector per line). Optionally a screenshot is attached. Identify the element that best matches the user's goal and return its selector. Return ONLY valid JSON. No markdown, no code fences.
+Format: {"selector": "css selector string"} if found (use the [selector] from the tree line), or {"selector": null, "reason": "brief reason"} if not found.`;
 
 let hfClient = null;
 let anthropicClient = null;
@@ -110,10 +114,67 @@ function parseHealResponse(raw) {
 
 /** Max length of DOM snippet to send (chars) to stay within context. */
 const MAX_DOM_CHARS = 12000;
+/** Max length of a11y snippet (token economy). */
+const MAX_A11Y_CHARS = 8000;
+
+/**
+ * Build a compact Accessibility Tree snippet from a DOM snapshot (role, name, selector per line).
+ * Sanitized for LLM; no full HTML. Used for AI-driven healing with optional screenshot.
+ * @param {Array<{ selector?: string, tagName?: string, role?: string, text?: string, ariaLabel?: string, placeholder?: string }>} snapshot - From getDomSnapshotInPage.
+ * @returns {string}
+ */
+function snapshotToA11yLines(snapshot) {
+  if (!Array.isArray(snapshot)) return "";
+  const lines = snapshot.map((e) => {
+    const role = (e.role || e.tagName || "unknown").toLowerCase();
+    const name = [e.ariaLabel, e.placeholder, e.text].filter(Boolean).join(" ").trim().slice(0, 80);
+    const sel = e.selector || "";
+    return `${role} "${name}" [${sel}]`;
+  });
+  return lines.join("\n").slice(0, MAX_A11Y_CHARS);
+}
+
+/**
+ * Get a CSS selector using sanitized Accessibility Tree and optional screenshot. Uses Haiku for simple repairs (token economy), Sonnet for complex reasoning.
+ * @param {string} instruction - User step (e.g. "Click on Companies Menu").
+ * @param {string} a11ySnippet - Compact a11y tree from snapshotToA11yLines(snapshot).
+ * @param {string} [screenshotBase64] - Optional base64 PNG for vision.
+ * @param {{ useComplexModel?: boolean }} [opts] - If true, use Sonnet; else Haiku.
+ * @returns {Promise<{ selector: string | null, reason?: string }>}
+ */
+async function getSelectorFromA11yAndImage(instruction, a11ySnippet, screenshotBase64, opts = {}) {
+  const useSonnet = !!opts.useComplexModel;
+  const model = useSonnet ? ANTHROPIC_MODEL : ANTHROPIC_MODEL_HAIKU;
+  const textContent = `User goal: ${instruction}\n\nAccessibility Tree (role "name" [selector]):\n${(a11ySnippet || "").slice(0, MAX_A11Y_CHARS)}`;
+  const anthropic = getAnthropicClient();
+  if (!anthropic) return getSelectorFromDom(instruction, a11ySnippet);
+
+  const content = [{ type: "text", text: textContent }];
+  if (screenshotBase64 && typeof screenshotBase64 === "string" && screenshotBase64.length > 0) {
+    content.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: screenshotBase64.replace(/^data:image\/\w+;base64,/, "") },
+    });
+  }
+
+  try {
+    const message = await anthropic.messages.create({
+      model,
+      max_tokens: 128,
+      system: HEAL_A11Y_SYSTEM_PROMPT,
+      messages: [{ role: "user", content }],
+    });
+    const textBlock = message.content?.find((b) => b.type === "text");
+    const raw = textBlock?.text?.trim();
+    return parseHealResponse(raw);
+  } catch (_) {
+    return { selector: null };
+  }
+}
 
 /**
  * Get a CSS selector for the element that matches the user's instruction, using the given DOM.
- * Tries HuggingFace first (cost-effective), then Claude. Does not loop; one call per provider.
+ * Claude only. Does not loop; one call.
  * @param {string} instruction - User step (e.g. "Click on Companies Menu").
  * @param {string} domSnippet - Sanitized HTML or JSON snapshot string (interactive subtree only).
  * @returns {Promise<{ selector: string | null, reason?: string }>}
@@ -124,29 +185,6 @@ async function getSelectorFromDom(instruction, domSnippet) {
     : JSON.stringify(domSnippet).slice(0, MAX_DOM_CHARS);
   const userContent = `User goal: ${instruction}\n\nDOM snippet:\n${snippet}`;
 
-  // 1) HuggingFace first (simpler/cheaper)
-  try {
-    const hf = getHfClient();
-    if (hf) {
-      const response = await hf.chatCompletion({
-        model: HF_MODEL,
-        messages: [
-          { role: "system", content: HEAL_SYSTEM_PROMPT },
-          { role: "user", content: userContent },
-        ],
-        max_tokens: 128,
-        temperature: 0,
-      });
-      const raw = response.choices?.[0]?.message?.content?.trim();
-      const result = parseHealResponse(raw);
-      if (result.selector) return result;
-      if (result.reason) return result;
-    }
-  } catch (_) {
-    // HF failed; try Claude
-  }
-
-  // 2) Claude fallback (strict JSON system prompt)
   try {
     const anthropic = getAnthropicClient();
     if (anthropic) {
@@ -158,18 +196,17 @@ async function getSelectorFromDom(instruction, domSnippet) {
       });
       const textBlock = message.content?.find((b) => b.type === "text");
       const raw = textBlock?.text?.trim();
-      const result = parseHealResponse(raw);
-      return result;
+      return parseHealResponse(raw);
     }
-  } catch (_) {
-    // both failed
-  }
+  } catch (_) {}
 
   return { selector: null };
 }
 
 module.exports = {
   getSelectorFromDom,
+  getSelectorFromA11yAndImage,
+  snapshotToA11yLines,
   domSanitizer,
   parseHealResponse,
   getCachedSelector,

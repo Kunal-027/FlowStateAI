@@ -1,13 +1,10 @@
 /**
  * LLM Step Interpreter. Same contract as instructionParser: { action, target, value? }.
- * Primary: Hugging Face. Fallback: Claude. Keys: HUGGINGFACE_API_KEY or HF_TOKEN, ANTHROPIC_API_KEY.
- * Use when parser returns null or when DOM disambiguation is needed (e.g. which "Submit" button).
+ * Claude only (ANTHROPIC_API_KEY). Use when parser returns null or when DOM disambiguation is needed.
  */
 
-const { InferenceClient } = require("@huggingface/inference");
 const Anthropic = require("@anthropic-ai/sdk").default ?? require("@anthropic-ai/sdk");
 
-const HF_MODEL = process.env.HF_MODEL || "Qwen/Qwen2.5-72B-Instruct";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-20241022";
 
 /** Canonical actions (must match instructionParser.ACTIONS for fill/click/navigate/hover/submit_search). */
@@ -39,15 +36,7 @@ Examples:
 
 Return only valid JSON.`;
 
-let hfClient = null;
 let anthropicClient = null;
-
-function getHfClient() {
-  const token = process.env.HUGGINGFACE_API_KEY || process.env.HF_TOKEN;
-  if (!token) return null;
-  if (!hfClient) hfClient = new InferenceClient(token);
-  return hfClient;
-}
 
 function getAnthropicClient() {
   const key = process.env.ANTHROPIC_API_KEY;
@@ -104,7 +93,7 @@ function parseActionResult(raw) {
 }
 
 /**
- * 1) Tries Hugging Face. 2) On failure or no key, tries Claude. 3) Returns null for parser fallback.
+ * Claude only. Returns { action, target, value?, _provider: "claude" } or null.
  * @param {string} intent - User goal / step instruction.
  * @param {unknown[]} domSnapshot - DOM snapshot from getDomSnapshotInPage.
  * @returns {Promise<{ action: string, target: string, value?: string } | null>}
@@ -112,26 +101,6 @@ function parseActionResult(raw) {
 async function getAiAction(intent, domSnapshot) {
   const snapshotStr = JSON.stringify((domSnapshot || []).slice(0, 150));
   const userContent = `User goal: ${intent}\n\nDOM snapshot:\n${snapshotStr}`;
-
-  try {
-    const hf = getHfClient();
-    if (hf) {
-      const response = await hf.chatCompletion({
-        model: HF_MODEL,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userContent },
-        ],
-        max_tokens: 256,
-        temperature: 0.1,
-      });
-      const raw = response.choices?.[0]?.message?.content?.trim();
-      const result = parseActionResult(raw);
-      if (result) return { ...result, _provider: "huggingface" };
-    }
-  } catch (_) {
-    // Hugging Face failed (error or no key); fall back to Claude
-  }
 
   try {
     const anthropic = getAnthropicClient();

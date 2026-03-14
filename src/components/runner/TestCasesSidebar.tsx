@@ -94,6 +94,7 @@ function TestCaseRow({
   onUpdateStep,
   onUpdateTestCase,
   onAddStep,
+  onInsertStep,
   onDeleteStep,
   onStepBlur,
 }: {
@@ -112,6 +113,7 @@ function TestCaseRow({
   onUpdateStep: (testCaseId: string, stepId: string, updates: Partial<TestStep>) => void;
   onUpdateTestCase: (testCaseId: string, updates: Partial<TestCase>) => void;
   onAddStep: (testCaseId: string) => void;
+  onInsertStep: (testCaseId: string, afterOrder: number) => void;
   onDeleteStep: (testCaseId: string, stepId: string) => void;
   onStepBlur?: () => void;
 }) {
@@ -289,7 +291,7 @@ function TestCaseRow({
             testCase.steps
               .slice()
               .sort((a, b) => a.order - b.order)
-              .map((step) => (
+              .flatMap((step) => [
                 <EditableStep
                   key={step.id}
                   testCaseId={testCase.id}
@@ -300,8 +302,19 @@ function TestCaseRow({
                   onDeleteStep={onDeleteStep}
                   onStepBlur={onStepBlur}
                   canDelete={true}
-                />
-              ))
+                />,
+                <div key={`insert-after-${step.id}`} className="flex items-center pl-6 pr-1 py-0.5">
+                  <button
+                    type="button"
+                    onClick={() => onInsertStep(testCase.id, step.order)}
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                    title="Add step below"
+                  >
+                    <Plus className="h-3 w-3" />
+                    Add below
+                  </button>
+                </div>,
+              ])
           )}
           <div className="px-4 pl-6 pt-1">
             <button
@@ -337,6 +350,7 @@ export function TestCasesSidebar({ className }: { className?: string }) {
   const updateTestCase = useExecutionStore((s) => s.updateTestCase);
   const updateStep = useExecutionStore((s) => s.updateStep);
   const addStep = useExecutionStore((s) => s.addStep);
+  const insertStep = useExecutionStore((s) => s.insertStep);
   const deleteStep = useExecutionStore((s) => s.deleteStep);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [savedFeedback, setSavedFeedback] = useState(false);
@@ -440,13 +454,22 @@ export function TestCasesSidebar({ className }: { className?: string }) {
     resumeResolveRef.current = null;
     mockCleanupRef.current?.();
     mockCleanupRef.current = null;
-    getExecutionState().setActiveStep(null);
-    getExecutionState().updateTestCase(id, {
+    const store = getExecutionState();
+    const activeStepId = store.activeStepId;
+    if (activeStepId) {
+      store.updateStep(id, activeStepId, { status: "failed", error: "Stopped by user" });
+    }
+    store.setActiveStep(null);
+    store.setActiveTestCase(null);
+    store.updateTestCase(id, {
       status: "failed",
       error: "Stopped by user",
       completedAt: new Date().toISOString(),
     });
-    getExecutionState().addLog({ level: "info", message: "Test stopped by user.", testCaseId: id });
+    store.addLog({ level: "info", message: "Test stopped by user.", testCaseId: id });
+    const send = store.bridgeSend;
+    const sessionId = store.streamSessionId;
+    if (send && sessionId) send({ type: "test_failed", sessionId });
   };
 
   /** Pause the running test (next step will wait until Resume). */
@@ -596,6 +619,7 @@ export function TestCasesSidebar({ className }: { className?: string }) {
                 onUpdateStep={handleUpdateStep}
                 onUpdateTestCase={handleUpdateTestCase}
                 onAddStep={addStep}
+                onInsertStep={insertStep}
                 onDeleteStep={deleteStep}
                 onStepBlur={handleStepBlur}
               />

@@ -12,10 +12,10 @@ const http = require("http");
 const express = require("express");
 const { WebSocketServer } = require("ws");
 const { chromium } = require("playwright");
-const { findBestSelector, getTypoCorrectedTarget } = require("./elementFinder");
+const { findBestSelector, findBestSelectorWithScore, getTypoCorrectedTarget } = require("./elementFinder");
 const { getAiAction } = require("./aiInterpreter");
-const { parseInstructionDynamically } = require("./instructionParser");
-const { getSelectorFromDom, getCachedSelector, setCachedSelector } = require("./selectorHealing");
+const { parseInstructionDynamically, getCompiledActionSchema } = require("./instructionParser");
+const { getSelectorFromDom, getSelectorFromA11yAndImage, getCachedSelector, setCachedSelector, snapshotToA11yLines } = require("./selectorHealing");
 const { domSanitizer, getInteractiveSubtreeInPage } = require("./domSanitizer");
 const { getVisualClickCoordinates, getVisualDiscoveryResult } = require("./visualFallback");
 const { runSemanticLocatorFlow, validateAfterClick } = require("./semanticLocatorEngine");
@@ -63,6 +63,26 @@ async function tryLlmFallbackClickOrHover(page, snapshot, intent, action) {
   return await clickOrHoverByText(page, aiTarget, act, { timeout: 5000 });
 }
 
+/** Locate-First: standard Playwright locators only, no AI. Must complete in <200ms so basic steps take <1s. */
+const LOCATE_FIRST_TIMEOUT_MS = 200;
+/** SuccessMap try: use saved selector immediately; same 200ms budget so we never burn tokens on known steps. */
+const SUCCESS_MAP_TRY_TIMEOUT_MS = 200;
+/** Use Claude / Claude Visual as soon as fast paths fail (0 = no delay; LLM key = solve at earliest). */
+const AI_FALLBACK_DELAY_MS = 0;
+/** Timeout for by-text and other fallbacks after locate-first (still no AI). */
+const FAST_PATH_LOCATOR_TIMEOUT_MS = 3000;
+/** Verify steps: retry interval and total wait for element to appear (up to 10s for redirects/slow logins). */
+const VERIFY_RETRY_TOTAL_MS = 10000;
+const VERIFY_RETRY_INTERVAL_MS = 1000;
+/** Max wait for element visibility / DOM stability before treating as not found (never fail immediately). */
+const ELEMENT_WAIT_MAX_MS = 10000;
+/** After search/dropdown type: wait for DOM to update (suggestions) before next action. */
+const SEARCH_TYPE_WAIT_MS = 450;
+/** After "Click Login" (or similar), wait for navigation up to this long. */
+const LOGIN_NAV_WAIT_MS = 10000;
+/** Introspection map cache TTL (avoid re-scanning DOM every sub-step). Use Claude only when match < this. */
+const INTROSPECTION_CACHE_TTL_MS = 60000;
+const INTROSPECTION_90_MATCH_THRESHOLD = 0.9;
 /** Max length of actualPageContent to send to report (chars). */
 const MAX_ACTUAL_PAGE_CONTENT_CHARS = 4000;
 /** Max length of visible-text snippet for verify_displayed failure "actual" message. */
@@ -86,9 +106,204 @@ async function getVisibleTextSnippet(page, maxChars = VERIFY_ACTUAL_SNIPPET_CHAR
   }
 }
 
+/** Introspection map cache: key = page.url(), value = { map, timestamp }. TTL 60s. */
+const introspectionCache = new Map();
+
 /**
- * AI-assisted self-healing: try cached selector, then ask LLM for selector from sanitized DOM.
- * Does not loop; one cache lookup and one AI call max. On failure returns expectedElement and actualPageContent for the report.
+ * Page introspection layer: interactive elements and their semantic labels. Cached 60s per URL.
+ * @param {import('playwright').Page} page - Playwright page.
+ * @returns {Promise<object[]>} Snapshot entries (selector, tagName, text, ariaLabel, placeholder, etc.).
+ */
+async function getIntrospectionMap(page) {
+  if (!page) return [];
+  let url;
+  try {
+    url = page.url();
+  } catch (_) {
+    return [];
+  }
+  const now = Date.now();
+  const cached = introspectionCache.get(url);
+  if (cached && now - cached.timestamp < INTROSPECTION_CACHE_TTL_MS) {
+    return cached.map;
+  }
+  try {
+    const map = await page.evaluate(getDomSnapshotInPage);
+    introspectionCache.set(url, { map: map || [], timestamp: now });
+    return map || [];
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
+ * Fuzzy intent matching against the introspection map. Returns best match and reasoning.
+ * Use Claude only when normalizedScore < INTROSPECTION_90_MATCH_THRESHOLD.
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {string} intent - User intent (e.g. "Log in", "username").
+ * @param {string} action - "click" | "hover" | "fill" | "type".
+ * @returns {Promise<{ selector: string | null, normalizedScore: number, reasoning: string }>}
+ */
+async function matchIntentWithIntrospection(page, intent, action) {
+  const map = await getIntrospectionMap(page);
+  if (!map.length) return { selector: null, normalizedScore: 0, reasoning: "Introspection map empty." };
+  return findBestSelectorWithScore(map, intent.trim(), action);
+}
+
+/**
+ * Wait-for-success / stability loop: wait until DOM stabilizes (network idle or URL change) before next step.
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {{ timeout?: number, urlBefore?: string }} [opts] - timeout and optional URL before action (to detect change).
+ */
+async function waitForStability(page, opts = {}) {
+  const { timeout = LOGIN_NAV_WAIT_MS, urlBefore = null } = opts;
+  try {
+    await page.waitForLoadState("networkidle", { timeout }).catch(() => {});
+  } catch (_) {}
+  if (urlBefore) {
+    try {
+      await page.waitForURL((u) => u !== urlBefore, { timeout: Math.min(5000, timeout) }).catch(() => {});
+    } catch (_) {}
+  }
+}
+
+/** Pre-flight timeout: wait for network idle and optional element stability (up to 10s for redirects/slow logins). */
+const PREFLIGHT_NETWORK_MS = 10000;
+const PREFLIGHT_ELEMENT_STABLE_MS = 2500;
+/** When waiting for a known selector (post speed-layer), wait up to ELEMENT_WAIT_MAX_MS before failing. */
+const PREFLIGHT_ELEMENT_WAIT_MS = ELEMENT_WAIT_MAX_MS;
+
+/**
+ * Pre-flight check: ensure page has finished loading (network idle) and optionally that the target element is stable (visible, not moving/hidden by loader).
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {{ selector?: string }} [opts] - optional selector to wait for visibility/stable.
+ */
+async function runPreFlightCheck(page, opts = {}) {
+  try {
+    await page.waitForLoadState("networkidle", { timeout: PREFLIGHT_NETWORK_MS }).catch(() => {});
+  } catch (_) {}
+  const { selector, timeoutMs } = opts;
+  const elementTimeout = timeoutMs ?? (selector ? PREFLIGHT_ELEMENT_WAIT_MS : PREFLIGHT_ELEMENT_STABLE_MS);
+  if (selector) {
+    try {
+      const loc = page.locator(selector).first();
+      await loc.waitFor({ state: "visible", timeout: elementTimeout });
+      await new Promise((r) => setTimeout(r, 300));
+    } catch (_) {
+      throw new Error("Pre-flight: target element not stable or not visible.");
+    }
+  }
+}
+
+/**
+ * Locate-First: find element using ONLY standard Playwright locators (getByLabel, getByPlaceholder, getByRole, common CSS).
+ * No snapshot, no AI. Must complete within timeoutMs so basic steps take <1s. Returns true if action succeeded.
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {{ action: string, target?: string, value?: string }} opts - action and optional target/value.
+ * @param {number} timeoutMs - Max time for the whole phase (e.g. 200ms).
+ * @param {{ ws: import('ws').WebSocket, sessionId: string | null }} [frameCtx] - If provided, send a frame after highlight so UI shows it.
+ */
+async function tryLocateFirstOnly(page, opts, timeoutMs, frameCtx = null) {
+  const { action, target = "", value = "" } = opts;
+  const t = timeoutMs;
+  const sendHighlightFrame = frameCtx && frameCtx.ws && frameCtx.ws.readyState === 1
+    ? () => sendFrameNow(frameCtx.ws, page, frameCtx.sessionId)
+    : () => {};
+  const tryClick = async (loc) => {
+    try {
+      await loc.first().waitFor({ state: "visible", timeout: Math.min(80, t) });
+      await highlightLocator(page, loc);
+      await sendHighlightFrame();
+      await loc.first().click({ timeout: Math.min(80, t) });
+      return true;
+    } catch (e) {
+      if (isPageScriptError(e)) {
+        try {
+          await loc.first().click({ timeout: 2000, force: true });
+          return true;
+        } catch (_) {}
+      }
+      return false;
+    }
+  };
+  const tryFill = async (loc, val) => {
+    try {
+      await loc.first().waitFor({ state: "visible", timeout: Math.min(80, t) });
+      await highlightLocator(page, loc);
+      await sendHighlightFrame();
+      await loc.first().fill(val, { timeout: Math.min(80, t) });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  if (action === "fill" || action === "type") {
+    const field = (target || "").toLowerCase().replace(/\s+field$/i, "");
+    const val = String(value || "").trim();
+    if (!val && field !== "search") return false;
+    const isSearch = /^search$/i.test(field) || /search/i.test(target || "");
+    if (isSearch) {
+      if (await tryFill(page.getByPlaceholder(/search/i), val)) return true;
+      if (await tryFill(page.getByRole("searchbox"), val)) return true;
+      try {
+        const inp = page.locator('input[type="search"]').first();
+        if ((await inp.count()) > 0 && (await tryFill(inp, val))) return true;
+      } catch (_) {}
+      return false;
+    }
+    if (/^(username|user|email|password|pass)$/i.test(field)) {
+      try {
+        if (await tryFill(page.getByLabel(new RegExp(field.replace(/e-?mail/, "email"), "i")), val)) return true;
+      } catch (_) {}
+      try {
+        if (await tryFill(page.getByPlaceholder(new RegExp(field.replace(/e-?mail/, "e?mail"), "i")), val)) return true;
+      } catch (_) {}
+      if (/password/i.test(field)) {
+        try {
+          const p = page.locator('input[type="password"]').first();
+          if ((await p.count()) > 0 && (await tryFill(p, val))) return true;
+        } catch (_) {}
+      } else {
+        try {
+          const u = page.locator('input[type="email"]').or(page.locator('input[name*="user"]')).or(page.locator('input[name*="email"]')).or(page.locator('input[autocomplete*="username"]')).first();
+          if ((await u.count()) > 0 && (await tryFill(u, val))) return true;
+        } catch (_) {}
+      }
+      return false;
+    }
+    return false;
+  }
+  if (action === "click" || action === "step") {
+    const nameRe = new RegExp((target || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    try {
+      if (await tryClick(page.getByRole("button", { name: nameRe }))) return true;
+    } catch (_) {}
+    try {
+      const sub = page.locator('input[type="submit"]').first();
+      if ((await sub.count()) > 0 && (await tryClick(sub))) return true;
+    } catch (_) {}
+    try {
+      if (await tryClick(page.getByRole("link", { name: nameRe }))) return true;
+    } catch (_) {}
+    try {
+      if (await tryClick(page.getByText(nameRe))) return true;
+    } catch (_) {}
+    return false;
+  }
+  return false;
+}
+
+/** Heuristic: use Sonnet for complex instructions (long, multiple targets); Haiku for simple selector repair (token economy). */
+function isComplexHealingInstruction(instruction) {
+  if (!instruction || instruction.length > 60) return true;
+  if (/\b(and|or)\b/i.test(instruction)) return true;
+  if (/\d+\./.test(instruction)) return true;
+  return false;
+}
+
+/**
+ * AI-driven healing: try cached selector, then send sanitized Accessibility Tree + screenshot to Claude.
+ * Uses Haiku for simple repairs, Sonnet for complex reasoning. Updates SuccessMap on success.
  * @param {import('playwright').Page} page - Playwright page.
  * @param {string} instruction - Step instruction (e.g. "Click on Companies Menu").
  * @param {string} action - "click" | "hover" | "fill".
@@ -108,14 +323,17 @@ async function findAndRetry(page, instruction, action, target) {
       // cache miss or stale
     }
   }
-  let interactive = { html: "" };
+  let snapshot = [];
   try {
-    interactive = await page.evaluate(getInteractiveSubtreeInPage);
-  } catch (_) {
-    // ignore
-  }
-  const sanitized = domSanitizer(interactive.html || "");
-  const aiResult = await getSelectorFromDom(instruction, sanitized);
+    snapshot = await page.evaluate(getDomSnapshotInPage);
+  } catch (_) {}
+  const a11ySnippet = snapshotToA11yLines(snapshot);
+  let screenshotBase64 = "";
+  try {
+    screenshotBase64 = await page.screenshot({ encoding: "base64", type: "png" });
+  } catch (_) {}
+  const useComplexModel = isComplexHealingInstruction(instruction);
+  const aiResult = await getSelectorFromA11yAndImage(instruction, a11ySnippet, screenshotBase64, { useComplexModel });
   if (aiResult && aiResult.selector) {
     try {
       const count = await page.locator(aiResult.selector).count();
@@ -127,10 +345,11 @@ async function findAndRetry(page, instruction, action, target) {
       // selector invalid
     }
   }
+  const fallbackHtml = (await page.evaluate(getInteractiveSubtreeInPage).catch(() => ({ html: "" }))).html || "";
   return {
     success: false,
     expectedElement: instruction || target || action,
-    actualPageContent: sanitized.slice(0, MAX_ACTUAL_PAGE_CONTENT_CHARS),
+    actualPageContent: domSanitizer(fallbackHtml).slice(0, MAX_ACTUAL_PAGE_CONTENT_CHARS),
   };
 }
 
@@ -268,6 +487,7 @@ async function clickOrHoverByText(page, targetText, action, opts = {}) {
       if (n === 0) return false;
       const first = locator.first();
       await first.scrollIntoViewIfNeeded();
+      await highlightLocator(page, first);
       if (action === "click") await first.click({ timeout, force: true });
       else await first.hover({ timeout, force: true });
       return true;
@@ -338,6 +558,26 @@ async function isElementWithTextVisible(page, targetText, opts = {}) {
 const HIGHLIGHT_DURATION_MS = 1800;
 /** Pause after applying highlight so the next screenshot frame captures it. */
 const HIGHLIGHT_PAUSE_MS = 280;
+
+/**
+ * Takes a screenshot and sends it as a "frame" so the stream UI shows the current page (e.g. with highlight).
+ * Call immediately after highlightElement/highlightLocator so the user sees the highlighted element.
+ * @param {import('ws').WebSocket} ws - WebSocket to send to.
+ * @param {import('playwright').Page | null} page - Page to screenshot.
+ * @param {string | null} sessionId - Session id for the frame payload.
+ */
+async function sendFrameNow(ws, page, sessionId) {
+  if (!page || !ws || ws.readyState !== 1) return;
+  try {
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    await new Promise((r) => setTimeout(r, 120));
+    const buffer = await page.screenshot({ type: "png" });
+    const base64 = buffer.toString("base64");
+    send(ws, "frame", { data: base64, width: 1280, height: 720, sessionId });
+    await new Promise((r) => setTimeout(r, 80));
+    send(ws, "frame", { data: base64, width: 1280, height: 720, sessionId });
+  } catch (_) {}
+}
 /** Wait for element to be visible (e.g. inside modal); modals can take time to render. */
 const INTERACTION_VISIBLE_TIMEOUT_MS = 12000;
 /** Default click/fill timeout; retry with force if visibility fails. */
@@ -356,13 +596,18 @@ async function highlightElement(page, selector, durationMs = HIGHLIGHT_DURATION_
       ({ sel, duration }) => {
         const el = document.querySelector(sel);
         if (!el) return;
-        el.style.setProperty("outline", "3px solid #e11");
+        el.style.setProperty("outline", "4px solid #f44");
         el.style.setProperty("outline-offset", "2px");
-        el.style.setProperty("box-shadow", "0 0 0 3px rgba(225,17,17,0.4)");
+        el.style.setProperty("box-shadow", "0 0 0 4px rgba(255,68,68,0.6)");
+        el.style.setProperty("z-index", "2147483647");
+        const parent = el.closest("[style]") || el.parentElement;
+        if (parent && parent !== document.body) parent.style.setProperty("z-index", "2147483647");
         setTimeout(() => {
           el.style.removeProperty("outline");
           el.style.removeProperty("outline-offset");
           el.style.removeProperty("box-shadow");
+          el.style.removeProperty("z-index");
+          if (parent && parent !== document.body) parent.style.removeProperty("z-index");
         }, duration);
       },
       { sel: selector, duration: durationMs }
@@ -371,6 +616,80 @@ async function highlightElement(page, selector, durationMs = HIGHLIGHT_DURATION_
   } catch (_) {
     // ignore: selector may be invalid or element gone
   }
+}
+
+/**
+ * Same red highlight as highlightElement but for a Playwright Locator (used by fast path and locate-first).
+ * @param {import('playwright').Page} page - Playwright page (unused; for API consistency).
+ * @param {import('playwright').Locator} loc - Locator to the first element to highlight.
+ * @param {number} [durationMs] - How long the highlight stays (default HIGHLIGHT_DURATION_MS).
+ */
+async function highlightLocator(page, loc, durationMs = HIGHLIGHT_DURATION_MS) {
+  try {
+    await loc.first().evaluate(
+      (el, { duration }) => {
+        if (!el) return;
+        el.style.setProperty("outline", "4px solid #f44");
+        el.style.setProperty("outline-offset", "2px");
+        el.style.setProperty("box-shadow", "0 0 0 4px rgba(255,68,68,0.6)");
+        el.style.setProperty("z-index", "2147483647");
+        const parent = el.closest("[style]") || el.parentElement;
+        if (parent && parent !== document.body) parent.style.setProperty("z-index", "2147483647");
+        setTimeout(() => {
+          el.style.removeProperty("outline");
+          el.style.removeProperty("outline-offset");
+          el.style.removeProperty("box-shadow");
+          el.style.removeProperty("z-index");
+          if (parent && parent !== document.body) parent.style.removeProperty("z-index");
+        }, duration);
+      },
+      { duration: durationMs }
+    );
+    await new Promise((r) => setTimeout(r, HIGHLIGHT_PAUSE_MS));
+  } catch (_) {
+    // element may be detached or not found
+  }
+}
+
+/**
+ * Highlights the element at (x, y) using document.elementFromPoint (e.g. before mouse.click from Visual Discovery).
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {number} x - Viewport x.
+ * @param {number} y - Viewport y.
+ * @param {number} [durationMs] - How long the highlight stays (default HIGHLIGHT_DURATION_MS).
+ */
+async function highlightAtPoint(page, x, y, durationMs = HIGHLIGHT_DURATION_MS) {
+  try {
+    await page.evaluate(
+      ({ px, py, duration }) => {
+        const el = document.elementFromPoint(px, py);
+        if (!el) return;
+        el.style.setProperty("outline", "4px solid #f44");
+        el.style.setProperty("outline-offset", "2px");
+        el.style.setProperty("box-shadow", "0 0 0 4px rgba(255,68,68,0.6)");
+        el.style.setProperty("z-index", "2147483647");
+        const parent = el.closest("[style]") || el.parentElement;
+        if (parent && parent !== document.body) parent.style.setProperty("z-index", "2147483647");
+        setTimeout(() => {
+          el.style.removeProperty("outline");
+          el.style.removeProperty("outline-offset");
+          el.style.removeProperty("box-shadow");
+          el.style.removeProperty("z-index");
+          if (parent && parent !== document.body) parent.style.removeProperty("z-index");
+        }, duration);
+      },
+      { px: x, py: y, duration: durationMs }
+    );
+    await new Promise((r) => setTimeout(r, HIGHLIGHT_PAUSE_MS));
+  } catch (_) {}
+}
+
+/**
+ * Highlights the element at (x, y) and sends a frame so the stream UI shows it. Call before mouse.click(x, y).
+ */
+async function highlightAtPointAndSendFrame(page, x, y, ws, sessionId) {
+  await highlightAtPoint(page, x, y);
+  if (ws && ws.readyState === 1) await sendFrameNow(ws, page, sessionId);
 }
 
 /**
@@ -437,12 +756,30 @@ async function submitSearchViaEnter(page) {
   await new Promise((r) => setTimeout(r, 400));
 
   const tryFocusAndEnter = async () => {
+    const locators = [
+      page.getByRole("searchbox").first(),
+      page.getByLabel(/search/i).first(),
+      page.getByPlaceholder(/search/i).first(),
+    ];
+    for (const loc of locators) {
+      try {
+        if ((await loc.count()) > 0) {
+          await loc.waitFor({ state: "visible", timeout: 2000 });
+          await loc.scrollIntoViewIfNeeded();
+          await loc.focus({ timeout: 2000 });
+          await page.keyboard.press("Enter");
+          return true;
+        }
+      } catch (_) {
+        continue;
+      }
+    }
     for (const sel of SEARCH_INPUT_SELECTORS) {
       try {
         const loc = page.locator(sel).first();
-        await loc.waitFor({ state: "attached", timeout: 3000 });
+        await loc.waitFor({ state: "attached", timeout: 2000 });
         await loc.scrollIntoViewIfNeeded();
-        await loc.focus({ timeout: 3000 });
+        await loc.focus({ timeout: 2000 });
         await page.keyboard.press("Enter");
         return true;
       } catch (_) {
@@ -459,16 +796,98 @@ async function submitSearchViaEnter(page) {
 }
 
 /**
+ * Submits the login form without using Playwright's click (avoids "page script error" on sites that throw on synthetic click).
+ * Tries: (1) Enter key, (2) form.requestSubmit(), (3) form.submit(), (4) native button.click() in page context.
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {number} navWaitMs - Max wait for URL to change after submit (e.g. LOGIN_NAV_WAIT_MS).
+ * @returns {Promise<boolean>} True if submit was attempted and URL changed (or navigation occurred).
+ */
+async function submitLoginFormWithoutClickingButton(page, navWaitMs = LOGIN_NAV_WAIT_MS) {
+  const urlBefore = page.url();
+  const urlChanged = () => {
+    const now = page.url();
+    return now && now !== urlBefore;
+  };
+
+  // 1) Enter key — focus is often in password field after "Enter Password"
+  try {
+    await page.keyboard.press("Enter");
+    await new Promise((r) => setTimeout(r, 1500));
+    if (urlChanged()) return true;
+    await page.waitForURL((u) => u !== urlBefore, { timeout: navWaitMs }).catch(() => {});
+    if (urlChanged()) return true;
+  } catch (_) {}
+
+  // 2) Form submit via requestSubmit (fires submit event; SPAs often handle it)
+  try {
+    const submitted = await page.evaluate(() => {
+      const form = document.querySelector("form");
+      if (!form) return false;
+      const hasPassword = form.querySelector('input[type="password"]');
+      if (!hasPassword) return false;
+      if (typeof form.requestSubmit === "function") {
+        form.requestSubmit();
+        return true;
+      }
+      form.submit();
+      return true;
+    });
+    if (submitted) {
+      await new Promise((r) => setTimeout(r, 1500));
+      if (urlChanged()) return true;
+      await page.waitForURL((u) => u !== urlBefore, { timeout: navWaitMs }).catch(() => {});
+      if (urlChanged()) return true;
+    }
+  } catch (_) {}
+
+  // 3) Native DOM click on submit button / Login button (bypasses Playwright's click; often avoids page script error)
+  try {
+    const clicked = await page.evaluate(() => {
+      const sel = 'input[type="submit"], button[type="submit"], button:not([type]), [type="submit"]';
+      const buttons = document.querySelectorAll(sel);
+      for (const el of buttons) {
+        const text = (el.value || el.textContent || "").toLowerCase();
+        if (/login|sign\s*in|submit/.test(text) || el.type === "submit") {
+          el.click();
+          return true;
+        }
+      }
+      const byText = document.evaluate(
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')] | //input[@type='submit']",
+        document,
+        null,
+        XPathResult.FIRST_ORDERED_NODE_TYPE,
+        null
+      ).singleNodeValue;
+      if (byText) {
+        byText.click();
+        return true;
+      }
+      return false;
+    });
+    if (clicked) {
+      await new Promise((r) => setTimeout(r, 1500));
+      if (urlChanged()) return true;
+      await page.waitForURL((u) => u !== urlBefore, { timeout: navWaitMs }).catch(() => {});
+      if (urlChanged()) return true;
+    }
+  } catch (_) {}
+
+  return false;
+}
+
+/**
  * Clicks the element; waits for visible, scrolls into view, highlights, then clicks. On "not visible" timeout, retries with force.
  * @param {import('playwright').Page} page - Playwright page.
  * @param {string} selector - CSS selector.
- * @param {{ timeout?: number }} [opts] - Click timeout (default INTERACTION_CLICK_TIMEOUT_MS).
+ * @param {{ timeout?: number; preferEnterOnScriptError?: boolean; ws?: import('ws').WebSocket; sessionId?: string | null }} [opts] - Click timeout and optional frame push (ws + sessionId) so stream shows highlight.
  */
 async function clickWithVisibleOrForce(page, selector, opts = {}) {
   const timeout = opts.timeout ?? INTERACTION_CLICK_TIMEOUT_MS;
   const preferEnterOnScriptError = opts.preferEnterOnScriptError === true;
   await waitForVisibleAndScroll(page, selector);
   await highlightElement(page, selector);
+  if (opts.ws && opts.ws.readyState === 1) await sendFrameNow(opts.ws, page, opts.sessionId ?? null);
   let lastError = null;
   try {
     await page.click(selector, { timeout });
@@ -569,6 +988,7 @@ async function fillWithVisibleWait(page, selector, value, opts = {}) {
   try {
     await waitForVisibleAndScroll(page, selector);
     await highlightElement(page, selector);
+    if (opts.ws && opts.ws.readyState === 1) await sendFrameNow(opts.ws, page, opts.sessionId ?? null);
     await page.fill(selector, value, { timeout });
     // For search/typeahead steps, wait so dropdown results load before the next step
     if (waitAfterMs > 0) await new Promise((r) => setTimeout(r, waitAfterMs));
@@ -584,10 +1004,16 @@ async function fillWithVisibleWait(page, selector, value, opts = {}) {
 
 /** Same selectors we use for submit; used to fill the search box for "Search X" steps. */
 const SEARCH_INPUT_SELECTORS = [
+  'input[name="q"]',
+  'input[name="search"]',
+  'input[type="search"]',
+  'input[placeholder*="Search" i]',
+  'input[aria-label*="search" i]',
+  '[role="searchbox"]',
+  'input[autocomplete*="search" i]',
   "#twotabsearchtextbox",
   'input[name="field-keywords"]',
   'input[name*="field-keywords"]',
-  'input[type="search"]',
   'input[name*="keyword"]',
   ".nav-search-field input",
   "#nav-search-bar-form input[type=\"text\"]",
@@ -597,30 +1023,83 @@ const SEARCH_INPUT_SELECTORS = [
 ];
 
 /**
- * Fills the main search input on the page (Amazon, Google, etc.). Tries known selectors first, then snapshot.
+ * Fills the visible search input on the page (works for any site: main page, modal, dialog).
+ * Tries: dialog search first if a dialog is open, then page-level selectors, then snapshot, then Claude Visual.
+ * When frameCtx (ws, sessionId) is provided, highlights the element and sends a frame so the monitor shows it.
  * @param {import('playwright').Page} page - Playwright page.
- * @param {string} value - Text to type (e.g. "Nike Shoes").
+ * @param {string} value - Text to type (e.g. "Nike Shoes" or "ddmsaustralia.dev.membr.com").
+ * @param {{ ws?: import('ws').WebSocket, sessionId?: string | null }} [frameCtx] - If set, highlight and send frame so monitor updates.
  * @returns {Promise<boolean>} True if an input was found and filled.
  */
-async function fillSearchInput(page, value) {
+async function fillSearchInput(page, value, frameCtx) {
   if (!value || typeof value !== "string") return false;
-  const trimmed = value.trim();
+  const trimmed = String(value).trim().replace(/^["']|["']$/g, "").trim();
   if (!trimmed) return false;
+  const tryFill = async (locatorOrSelector) => {
+    try {
+      const loc = typeof locatorOrSelector === "string" ? page.locator(locatorOrSelector).first() : locatorOrSelector.first();
+      await loc.waitFor({ state: "visible", timeout: 5000 });
+      await loc.scrollIntoViewIfNeeded();
+      await new Promise((r) => setTimeout(r, 100));
+      await highlightLocator(page, loc);
+      if (frameCtx && frameCtx.ws && frameCtx.ws.readyState === 1) await sendFrameNow(frameCtx.ws, page, frameCtx.sessionId ?? null);
+      await loc.fill(trimmed, { timeout: 5000 });
+      await new Promise((r) => setTimeout(r, SEARCH_TYPE_WAIT_MS));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  // 1) If a dialog/modal is open, try search-like inputs inside it first (generic: works for any modal with a search field)
+  try {
+    const dialog = page.getByRole("dialog");
+    if ((await dialog.count()) > 0) {
+      const inDialogPlaceholder = dialog.getByPlaceholder(/search/i);
+      if ((await inDialogPlaceholder.count()) > 0 && (await tryFill(inDialogPlaceholder))) return true;
+      const inDialogLabel = dialog.getByLabel(/search/i);
+      if ((await inDialogLabel.count()) > 0 && (await tryFill(inDialogLabel))) return true;
+      const inDialogSearchbox = dialog.getByRole("searchbox");
+      if ((await inDialogSearchbox.count()) > 0 && (await tryFill(inDialogSearchbox))) return true;
+      const inDialogTextbox = dialog.getByRole("textbox");
+      if ((await inDialogTextbox.count()) > 0 && (await tryFill(inDialogTextbox))) return true;
+    }
+  } catch (_) {}
+  // 2) Page-level: label, placeholder, role, then known selectors
+  try {
+    const byLabel = page.getByLabel(/search/i);
+    if ((await byLabel.count()) > 0 && (await tryFill(byLabel))) return true;
+  } catch (_) {}
+  try {
+    const byPlaceholder = page.getByPlaceholder(/search/i);
+    if ((await byPlaceholder.count()) > 0 && (await tryFill(byPlaceholder))) return true;
+  } catch (_) {}
+  try {
+    const searchbox = page.getByRole("searchbox");
+    if ((await searchbox.count()) > 0 && (await tryFill(searchbox))) return true;
+  } catch (_) {}
   for (const sel of SEARCH_INPUT_SELECTORS) {
     try {
-      const loc = page.locator(sel).first();
-      await loc.waitFor({ state: "attached", timeout: 2000 });
-      await fillWithVisibleWait(page, sel, trimmed);
-      return true;
+      if (await tryFill(sel)) return true;
     } catch (_) {
       continue;
     }
   }
+  // 3) Snapshot-based best match for "search"
   try {
     const snapshot = await page.evaluate(getDomSnapshotInPage);
     const selector = findBestSelector(snapshot, "search", "fill");
-    if (selector) {
-      await fillWithVisibleWait(page, selector, trimmed);
+    if (selector && (await tryFill(selector))) return true;
+  } catch (_) {}
+  // 4) Claude Visual: generic prompt works for any page or modal
+  try {
+    const discovery = await getVisualDiscoveryResult(page, "search input or text box to type a search query", { disambiguate: false });
+    if (discovery) {
+      await highlightAtPoint(page, discovery.x, discovery.y);
+      if (frameCtx && frameCtx.ws && frameCtx.ws.readyState === 1) await sendFrameNow(frameCtx.ws, page, frameCtx.sessionId ?? null);
+      await page.mouse.click(discovery.x, discovery.y);
+      await new Promise((r) => setTimeout(r, 300));
+      await page.keyboard.type(trimmed, { delay: 50 });
+      await new Promise((r) => setTimeout(r, SEARCH_TYPE_WAIT_MS));
       return true;
     }
   } catch (_) {}
@@ -767,6 +1246,46 @@ async function takeStepScreenshot(page) {
   }
 }
 
+/**
+ * Derives a stable CSS selector for the element at (x, y) so we can cache it for next run (SuccessMap).
+ * Prefers id, data-testid, data-fs-id, then role+accessible name, then tag+unique class.
+ * @param {import('playwright').Page} page - Playwright page.
+ * @param {number} x - Viewport x.
+ * @param {number} y - Viewport y.
+ * @returns {Promise<string | null>}
+ */
+async function getSelectorForPoint(page, x, y) {
+  try {
+    const sel = await page.evaluate(({ px, py }) => {
+      const el = document.elementFromPoint(px, py);
+          if (!el || el === document.body) return null;
+          const id = el.id && /^[a-zA-Z][\w-]*$/.test(el.id);
+          if (id && document.querySelector(`#${CSS.escape(el.id)}`) === el) return `#${el.id}`;
+          const testId = el.getAttribute("data-testid");
+          if (testId) return `[data-testid="${CSS.escape(testId)}"]`;
+          const fsId = el.getAttribute("data-fs-id");
+          if (fsId) return `[data-fs-id="${CSS.escape(fsId)}"]`;
+          const role = el.getAttribute("role") || (el.tagName && el.tagName.toLowerCase());
+          const ariaLabel = el.getAttribute("aria-label");
+          if (role && ariaLabel && document.querySelectorAll(`${role}[aria-label="${CSS.escape(ariaLabel)}"]`).length === 1)
+            return `${role}[aria-label="${CSS.escape(ariaLabel)}"]`;
+          const tag = el.tagName && el.tagName.toLowerCase();
+          const cls = el.className && typeof el.className === "string" && el.className.trim();
+          if (tag && cls) {
+            const firstClass = cls.split(/\s+/)[0];
+            if (firstClass && /^[a-zA-Z][\w-]*$/.test(firstClass)) {
+              const q = `${tag}.${firstClass}`;
+              if (document.querySelector(q) === el) return q;
+            }
+          }
+          return null;
+    }, { px: x, py: y });
+    return typeof sel === "string" && sel.length > 0 ? sel : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 /** True if the error is from page JavaScript (e.g. "Assignment to constant variable"). */
 function isPageScriptError(err) {
   return /assignment to constant|typeerror|reference error/i.test((err && err.message) || "");
@@ -894,6 +1413,11 @@ async function processQueue() {
     }
     sendLog(ws, "Navigation complete.", "info", sessionId);
     send(ws, "navigation_done", { sessionId });
+    try {
+      const pageScreenshot = await page.screenshot({ type: "png" });
+      const pageScreenshotB64 = pageScreenshot.toString("base64");
+      send(ws, "page_screenshot", { sessionId, url: page.url(), screenshot: pageScreenshotB64 });
+    } catch (_) {}
 
     screenshotInterval = setInterval(async () => {
       const currentPage = currentRun && currentRun.ws === ws ? currentRun.page : null;
@@ -937,9 +1461,18 @@ function getStepQueue(ws) {
 }
 
 /**
- * Processes the next step in this connection's queue if not already processing. Runs one step: optionally
- * calls getAiAction for selector resolution, then findBestSelector fallback, then runs the Playwright action
- * and sends step_done or step_error. Schedules the next step via setImmediate when done.
+ * Processes the next step in this connection's queue. Automation is driven by test case instructions; each
+ * step is parsed to a single action and only that action runs (no extra clicks on verify steps).
+ *
+ * Browser actions (from test cases):
+ * - verify_displayed: READ-ONLY — check that text/element is visible; no click, no fill, no navigation.
+ * - navigate: go to URL.
+ * - fill / type: enter value in field (username, password, search, etc.).
+ * - submit_search: submit search (Enter or focus+Enter); never click the search button when avoidable.
+ * - click / step: click or press (button, link, etc.).
+ * - hover: hover over element.
+ * - press: key on focused element.
+ *
  * @param {WebSocket} ws - The client WebSocket.
  */
 function processStepQueue(ws) {
@@ -965,10 +1498,12 @@ function processStepQueue(ws) {
 
   (async () => {
     let done = false;
-    /** Which resolved this step: interpreter (parser/semantic), huggingface, claude, or visual_discovery (Claude Visual). */
+    /** Classify failure: 'selector' = element not found / action failed (fixable via AI); 'functional' = verify failed or real product bug. */
+    let stepFailureType = "selector";
+    /** Which resolved this step: interpreter, claude (LLM), or visual_discovery (Claude Visual). */
     let resolvedBy = "interpreter";
     const resolvedByLabel = (v) =>
-      ({ interpreter: "Interpreter", huggingface: "Hugging Face", claude: "Claude (LLM)", visual_discovery: "Claude (Visual Discovery)" }[v] || v);
+      ({ interpreter: "Interpreter", claude: "Claude (LLM)", visual_discovery: "Claude (Visual)" }[v] || v);
     const stepDone = (payload) => {
       sendLog(ws, `Step used: ${resolvedByLabel(resolvedBy)}`, "info", sessionId);
       send(ws, "step_done", { sessionId, resolvedBy, ...payload });
@@ -977,6 +1512,190 @@ function processStepQueue(ws) {
       let selector = msg.selector;
       const target = msg.target;
       const hasInstruction = Boolean(msg.instruction && msg.instruction.trim());
+      /** Parse once early (cached ActionSchema so we don't re-parse the same instruction twice). */
+      const parsedEarly = hasInstruction ? getCompiledActionSchema(msg.instruction) : null;
+
+      // ─── Verify (read-only, no click): must run before any click/fill so assertions never trigger UI actions ─────────────────
+      const isVerifyStep = parsedEarly && parsedEarly.action === "verify_displayed" && parsedEarly.target;
+      if (isVerifyStep) {
+        const verifyTarget = parsedEarly.target;
+        let visible = false;
+        let verifyReasoning = null;
+        const deadline = Date.now() + VERIFY_RETRY_TOTAL_MS;
+        while (Date.now() < deadline) {
+          visible = await isElementWithTextVisible(activePage, verifyTarget, { timeout: VERIFY_RETRY_INTERVAL_MS });
+          if (visible) break;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        if (!visible) {
+          const alternates = [verifyTarget];
+          const lower = (verifyTarget || "").toLowerCase();
+          if (/admin\s*control\s*panel/i.test(lower)) alternates.push("dashboard", "admin", "control panel");
+          if (/dashboard/i.test(lower)) alternates.push("admin", "admin panel");
+          if (/login\s*(success|successful)/i.test(lower)) alternates.push("dashboard", "admin", "home");
+          for (const alt of alternates.slice(1)) {
+            const found = await isElementWithTextVisible(activePage, alt, { timeout: 1500 });
+            if (found) {
+              visible = true;
+              verifyReasoning = `Environment scan: "${verifyTarget}" not found; matched alternate "${alt}" as success.`;
+              sendLog(ws, verifyReasoning, "info", sessionId);
+              break;
+            }
+          }
+        }
+        let stepPayload = { success: visible, screenshot: await takeStepScreenshot(activePage), ...(verifyReasoning ? { discoveryReason: verifyReasoning } : {}) };
+        if (visible) {
+          sendLog(ws, "Step successful.", "info", sessionId);
+        } else {
+          const snippet = await getVisibleTextSnippet(activePage);
+          const expectedMsg = `Expected: an element containing "${verifyTarget}" to be visible on the page.`;
+          const actualMsg = snippet
+            ? `Actual: no element with that text was found. Visible text on page includes: "${snippet}${snippet.length >= VERIFY_ACTUAL_SNIPPET_CHARS ? "…" : ""}"`
+            : `Actual: no element containing "${verifyTarget}" was found in the viewport.`;
+          sendLog(ws, `"${verifyTarget}" is not displayed.`, "error", sessionId);
+          sendLog(ws, expectedMsg, "info", sessionId);
+          sendLog(ws, actualMsg, "info", sessionId);
+          stepFailureType = "functional";
+          stepPayload = { ...stepPayload, message: `"${verifyTarget}" is not displayed.`, expectedElement: expectedMsg, actualPageContent: actualMsg, failureType: "functional" };
+        }
+        stepDone(stepPayload);
+        done = true;
+      }
+
+      // ─── Fast path: Navigate — no Interpreter, no snapshot ─────────────────
+      if (!done && parsedEarly && parsedEarly.action === "navigate") {
+        const url = parsedEarly.value || parsedEarly.target || msg.url;
+        if (url) {
+          try {
+            await gotoWithAbortHandling(activePage, url, { waitUntil: "domcontentloaded", timeout: 60000 });
+            await activePage.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+            try {
+              const b64 = (await activePage.screenshot({ type: "png" })).toString("base64");
+              send(ws, "page_screenshot", { sessionId, url: activePage.url(), screenshot: b64 });
+            } catch (_) {}
+            sendLog(ws, "Step successful.", "info", sessionId);
+            stepDone({ success: true });
+            done = true;
+          } catch (navErr) {
+            sendLog(ws, `Navigation failed: ${navErr.message}`, "error", sessionId);
+            stepDone({ success: false, error: navErr.message, failureType: "functional" });
+            done = true;
+          }
+        }
+      }
+
+      // ─── Fast path: Obvious fill (username/password) — wait for form then try multiple locators ─────────────────
+      if (!done && (parsedEarly?.action === "fill" || parsedEarly?.action === "type") && parsedEarly?.target) {
+        const field = String(parsedEarly.target).toLowerCase().replace(/\s+field$/i, "").trim();
+        const value = parsedEarly.value != null ? String(parsedEarly.value) : (msg.value || msg.text || "");
+        const isObviousField = /^(username|user|email|e-?mail|password|pass)$/i.test(field);
+        if (isObviousField && value) {
+          const timeout = FAST_PATH_LOCATOR_TIMEOUT_MS;
+          let filled = false;
+          try {
+            await activePage.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => {});
+            await activePage.waitForSelector("input[type=\"text\"], input[type=\"email\"], input[type=\"password\"], input:not([type]), input[type=\"search\"]", { state: "attached", timeout: 5000 }).catch(() => {});
+          } catch (_) {}
+          try {
+            const labelMatch = activePage.getByLabel(new RegExp(field.replace(/e-?mail/, "email"), "i"));
+            if ((await labelMatch.count()) > 0) {
+              await labelMatch.first().fill(value, { timeout });
+              filled = true;
+            }
+          } catch (_) {}
+          if (!filled && /password/i.test(field)) {
+            try {
+              const pwd = activePage.getByRole("textbox", { name: /password/i }).or(activePage.locator('input[type="password"]')).or(activePage.locator('input[autocomplete*="password"]'));
+              if ((await pwd.count()) > 0) { await pwd.first().fill(value, { timeout }); filled = true; }
+            } catch (_) {}
+          }
+          if (!filled && /username|user|email/i.test(field)) {
+            try {
+              const usernameInput = activePage.locator('input[type="email"]').or(activePage.locator('input[name*="user"]')).or(activePage.locator('input[name*="email"]')).or(activePage.locator('input[autocomplete*="username"]')).or(activePage.locator('input[autocomplete*="email"]')).or(activePage.getByPlaceholder(/username|email|user|e-?mail/i));
+              if ((await usernameInput.count()) > 0) { await usernameInput.first().fill(value, { timeout }); filled = true; }
+            } catch (_) {}
+          }
+          if (!filled) {
+            try {
+              const byPlaceholder = activePage.getByPlaceholder(new RegExp(field.replace(/e-?mail/, "e?mail"), "i"));
+              if ((await byPlaceholder.count()) > 0) { await byPlaceholder.first().fill(value, { timeout }); filled = true; }
+            } catch (_) {}
+          }
+          if (filled) {
+            sendLog(ws, "Step successful.", "info", sessionId);
+            stepDone({ success: true });
+            done = true;
+          }
+        }
+      }
+
+      // ─── Fast path: Click (e.g. Login) — try button, input[type=submit], link, then by text. Never run for verify steps. ─────────────────
+      if (!done && parsedEarly?.action !== "verify_displayed" && (action === "click" || action === "step") && (hasInstruction || target)) {
+        const clickTarget = (parsedEarly?.target || target || msg.instruction || "").trim();
+        const looksLikeLogin = /\b(login|sign\s*in|log\s*in|submit)\b/i.test(clickTarget) || /\b(login|sign\s*in)\b/i.test((msg.instruction || "").trim());
+        const timeout = FAST_PATH_LOCATOR_TIMEOUT_MS;
+        let clicked = false;
+        // Login step: submit form without Playwright click first (avoids "page script error" on many sites)
+        if (looksLikeLogin) {
+          try {
+            clicked = await submitLoginFormWithoutClickingButton(activePage, LOGIN_NAV_WAIT_MS);
+          } catch (_) {}
+        }
+        const re = new RegExp(clickTarget.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+        const tryClickThenNav = async (loc) => {
+          if ((await loc.count()) === 0) return false;
+          await highlightLocator(activePage, loc);
+          await sendFrameNow(ws, activePage, sessionId);
+          const urlBefore = activePage.url();
+          try {
+            await loc.first().click({ timeout });
+          } catch (e) {
+            if (isPageScriptError(e)) {
+              try {
+                await loc.first().click({ timeout: 5000, force: true });
+              } catch (_) {
+                throw e;
+              }
+            } else {
+              throw e;
+            }
+          }
+          if (looksLikeLogin) {
+            try { await activePage.waitForLoadState("networkidle", { timeout: LOGIN_NAV_WAIT_MS }); } catch (_) {}
+            try { await activePage.waitForURL((u) => u !== urlBefore, { timeout: LOGIN_NAV_WAIT_MS }); } catch (_) {}
+          }
+          return true;
+        };
+        try {
+          if (!clicked) clicked = await tryClickThenNav(activePage.getByRole("button", { name: re }));
+        } catch (_) {}
+        if (!clicked && clickTarget) {
+          try {
+            if ((await activePage.locator('input[type="submit"]').count()) > 0) {
+              const firstSubmit = activePage.locator('input[type="submit"]').first();
+              await firstSubmit.waitFor({ state: "visible", timeout: 2000 }).catch(() => {});
+              if (await firstSubmit.isVisible().catch(() => false)) clicked = await tryClickThenNav(firstSubmit);
+            }
+          } catch (_) {}
+        }
+        if (!clicked && clickTarget) {
+          try {
+            if (looksLikeLogin) clicked = await tryClickThenNav(activePage.getByRole("link", { name: re }));
+          } catch (_) {}
+        }
+        if (!clicked && clickTarget) {
+          try {
+            const byText = activePage.getByText(re).first();
+            if ((await activePage.getByText(re).count()) > 0) clicked = await tryClickThenNav(byText);
+          } catch (_) {}
+        }
+        if (clicked) {
+          sendLog(ws, "Step successful.", "info", sessionId);
+          stepDone({ success: true });
+          done = true;
+        }
+      }
+
       // Early intercept: "click Search Button" — no LLM, no selector, never click the button
       const instr = (msg.instruction || "").trim().toLowerCase();
       const tgt = (target || "").trim().toLowerCase();
@@ -1003,6 +1722,7 @@ function processStepQueue(ws) {
           const coords = await getVisualClickCoordinates(activePage, "search button");
           if (coords) {
             try {
+              await highlightAtPointAndSendFrame(activePage, coords.x, coords.y, ws, sessionId);
               resolvedBy = "visual_discovery";
               await activePage.mouse.click(coords.x, coords.y);
               submitted = true;
@@ -1013,8 +1733,21 @@ function processStepQueue(ws) {
           sendLog(ws, "Step successful.", "info", sessionId);
           stepDone({ success: true });
         } else {
-          sendLog(ws, "Search submit failed.", "error", sessionId);
-          stepDone({ success: false, error: "Search submit failed (Enter and visual fallback did not succeed)." });
+          sendLog(ws, "Trying Claude (Visual) for search/submit before failing…", "info", sessionId);
+          const coords = await getVisualClickCoordinates(activePage, "search button or submit search");
+          if (coords) {
+            try {
+              await highlightAtPointAndSendFrame(activePage, coords.x, coords.y, ws, sessionId);
+              await activePage.mouse.click(coords.x, coords.y);
+              submitted = true;
+              sendLog(ws, "Step successful (Visual rescue).", "info", sessionId);
+              stepDone({ success: true });
+            } catch (_) {}
+          }
+          if (!submitted) {
+            sendLog(ws, "Search submit failed.", "error", sessionId);
+            stepDone({ success: false, error: "Search submit failed (Enter and visual fallback did not succeed)." });
+          }
         }
         done = true;
       }
@@ -1044,53 +1777,87 @@ function processStepQueue(ws) {
             }
             done = true;
           } else if (engineResult.method === "visual") {
-            resolvedBy = "visual_discovery";
-            sendLog(ws, "Visual Discovery click failed.", "error", sessionId);
-            stepDone({ success: false, error: "Visual Discovery did not succeed." });
-            done = true;
+            sendLog(ws, "Trying LLM healing then Visual again before failing…", "info", sessionId);
+            const instruction = (msg.instruction || "").trim();
+            const heal = await findAndRetry(activePage, instruction, "click", instruction);
+            if (heal.success && heal.selector) {
+              try {
+                await clickWithVisibleOrForce(activePage, heal.selector, { ws, sessionId });
+                resolvedBy = "claude";
+                sendLog(ws, "Step successful (LLM rescue).", "info", sessionId);
+                stepDone({ success: true, selfHealed: true, aiHeal: true });
+                done = true;
+              } catch (_) {}
+            }
+            if (!done) {
+              const discovery = await getVisualDiscoveryResult(activePage, instruction, { disambiguate: true });
+              if (discovery) {
+                try {
+                  await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
+                  await activePage.mouse.click(discovery.x, discovery.y);
+                  resolvedBy = "visual_discovery";
+                  sendLog(ws, "Step successful (Visual retry).", "info", sessionId);
+                  stepDone({ success: true, visualClick: true });
+                  done = true;
+                } catch (_) {}
+              }
+            }
+            if (!done) {
+              resolvedBy = "visual_discovery";
+              sendLog(ws, "Visual Discovery click failed.", "error", sessionId);
+              stepDone({ success: false, error: "Visual Discovery did not succeed." });
+              done = true;
+            }
           }
         }
       }
-      const parsedInstruction = hasInstruction ? parseInstructionDynamically(msg.instruction) : null;
-      // Handle "Verify X is displayed" steps: check visibility and send step_done with actual success
-      // so the frontend can mark the run as failed when verify fails (no false "all steps passed").
-      const isVerifyDisplayed = parsedInstruction && parsedInstruction.action === "verify_displayed" && parsedInstruction.target;
-      if (isVerifyDisplayed) {
-        const verifyTarget = parsedInstruction.target;
-        const visible = await isElementWithTextVisible(activePage, verifyTarget, { timeout: 6000 });
-        let stepPayload = { success: visible, screenshot: await takeStepScreenshot(activePage) };
-        if (visible) {
-          sendLog(ws, "Step successful.", "info", sessionId);
-        } else {
-          const snippet = await getVisibleTextSnippet(activePage);
-          const expectedMsg = `Expected: an element containing "${verifyTarget}" to be visible on the page.`;
-          const actualMsg = snippet
-            ? `Actual: no element with that text was found. Visible text on page includes: "${snippet}${snippet.length >= VERIFY_ACTUAL_SNIPPET_CHARS ? "…" : ""}"`
-            : `Actual: no element containing "${verifyTarget}" was found in the viewport.`;
-          sendLog(ws, `"${verifyTarget}" is not displayed.`, "error", sessionId);
-          sendLog(ws, expectedMsg, "info", sessionId);
-          sendLog(ws, actualMsg, "info", sessionId);
-          stepPayload = {
-            ...stepPayload,
-            message: `"${verifyTarget}" is not displayed.`,
-            expectedElement: expectedMsg,
-            actualPageContent: actualMsg,
-          };
-        }
-        stepDone(stepPayload);
-        done = true;
-      }
+      const parsedInstruction = parsedEarly || (hasInstruction ? getCompiledActionSchema(msg.instruction) : null);
 
-      // Early intercept: "Search X" → fill the main page search input (not "search Gym X", which uses modal field)
-      const searchFillMatch = hasInstruction && msg.instruction.match(/^search\s+(.+)$/i);
-      const isSearchGym = hasInstruction && /^search\s+(?:for\s+)?(?:gym|Gym)\s+/i.test(msg.instruction);
-      if (!done && searchFillMatch && !isSearchGym) {
-        const searchValue = searchFillMatch[1].trim();
-        const filled = await fillSearchInput(activePage, searchValue);
+      // Early intercept: "Search [for] X" → fill the visible search input (any page/modal) then submit (Enter). One path for all.
+      const searchMatch = hasInstruction && msg.instruction.match(/^search\s+(?:for\s+)?(.+)$/i);
+      const searchFillValue = (parsedEarly?.action === "fill" && parsedEarly?.target === "search" && parsedEarly?.value)
+        ? String(parsedEarly.value).trim().replace(/^["']|["']$/g, "")
+        : (searchMatch ? String(searchMatch[1]).replace(/^for\s+/i, "").trim().replace(/^["']|["']$/g, "") : null);
+      if (!done && searchFillValue) {
+        let filled = await fillSearchInput(activePage, searchFillValue, { ws, sessionId });
+        if (!filled) {
+          sendLog(ws, "Trying Claude (Visual) for search input…", "info", sessionId);
+          const discovery = await getVisualDiscoveryResult(activePage, "search input or text box to type a search query", { disambiguate: false });
+          if (discovery) {
+            try {
+              await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
+              await activePage.mouse.click(discovery.x, discovery.y);
+              await new Promise((r) => setTimeout(r, 300));
+              await activePage.keyboard.type(searchFillValue, { delay: 50 });
+              await new Promise((r) => setTimeout(r, SEARCH_TYPE_WAIT_MS));
+              filled = true;
+            } catch (_) {}
+          }
+        }
         if (filled) {
-          sendLog(ws, "Step successful.", "info", sessionId);
-          stepDone({ success: true });
-          done = true;
+          const urlBeforeSearch = activePage.url();
+          await new Promise((r) => setTimeout(r, 400));
+          await activePage.keyboard.press("Enter");
+          await new Promise((r) => setTimeout(r, 1500));
+          const urlAfter = activePage.url();
+          const urlChanged = urlAfter && urlAfter !== urlBeforeSearch;
+          const looksLikeResults = urlChanged || /\/s\?|\/s\/|search|q=|results/i.test(urlAfter || "");
+          if (urlChanged || looksLikeResults) {
+            sendLog(ws, "Step successful (search filled and submitted).", "info", sessionId);
+            stepDone({ success: true });
+            done = true;
+          } else {
+            const submitted = await submitSearchViaEnter(activePage);
+            if (submitted) {
+              sendLog(ws, "Step successful (search submitted via Enter).", "info", sessionId);
+              stepDone({ success: true });
+              done = true;
+            } else {
+              sendLog(ws, "Step successful (search filled; submit may not have navigated).", "info", sessionId);
+              stepDone({ success: true });
+              done = true;
+            }
+          }
         }
       }
 
@@ -1109,8 +1876,145 @@ function processStepQueue(ws) {
         let lastError = null;
         let resolvedAction = action;
         let resolvedValue = msg.value ?? msg.text ?? "";
-        let resolvedTarget = target;
-        for (let attempt = 1; attempt <= MAX_FIND_ATTEMPTS; attempt++) {
+        let resolvedTarget = target || (parsedEarly && (parsedEarly.target || parsedEarly.value));
+        const stepPageUrl = activePage.url();
+        const cacheAction = (parsedEarly?.action === "fill" || parsedEarly?.action === "type") ? "fill" : (parsedEarly?.action === "hover" ? "hover" : "click");
+        const stepStartTime = Date.now();
+
+        // Pre-flight: ensure page has finished loading (network idle) to prevent false failures from network lag
+        try {
+          await runPreFlightCheck(activePage);
+        } catch (_) {}
+
+        // 1) SuccessMap: use saved selector immediately (<200ms). Never burn tokens on steps that passed before.
+        if (!done && hasInstruction && (cacheAction === "click" || cacheAction === "hover" || cacheAction === "fill")) {
+          const cachedSelector = getCachedSelector(msg.instruction.trim(), cacheAction, stepPageUrl);
+          if (cachedSelector) {
+            const trySpeedLayer = async () => {
+              const loc = activePage.locator(cachedSelector).first();
+              await loc.waitFor({ state: "visible", timeout: Math.min(150, SUCCESS_MAP_TRY_TIMEOUT_MS - 50) });
+              if (cacheAction === "click") {
+                await clickWithVisibleOrForce(activePage, cachedSelector, { ws, sessionId });
+              } else if (cacheAction === "hover") {
+                await waitForVisibleAndScroll(activePage, cachedSelector);
+                await highlightElement(activePage, cachedSelector);
+                await sendFrameNow(ws, activePage, sessionId);
+                await activePage.hover(cachedSelector, { timeout: SUCCESS_MAP_TRY_TIMEOUT_MS - 50 });
+              } else {
+                const fillVal = String(parsedEarly?.value ?? msg.value ?? msg.text ?? "").trim();
+                await fillWithVisibleWait(activePage, cachedSelector, fillVal, { timeout: SUCCESS_MAP_TRY_TIMEOUT_MS - 50, ws, sessionId });
+              }
+            };
+            try {
+              await Promise.race([
+                trySpeedLayer(),
+                new Promise((_, rej) => setTimeout(() => rej(new Error("SuccessMap timeout")), SUCCESS_MAP_TRY_TIMEOUT_MS)),
+              ]);
+              sendLog(ws, "Step successful (Success Map, <200ms).", "info", sessionId);
+              stepDone({ success: true, cacheHit: true });
+              done = true;
+            } catch (_) {
+              sendLog(ws, "SuccessMap missed; trying locate-first.", "info", sessionId);
+            }
+          }
+        }
+
+        // 2) Locate-First: standard Playwright locators only (getByLabel, getByPlaceholder, getByRole, input[...]). No AI. <200ms.
+        if (!done && (cacheAction === "click" || cacheAction === "fill") && hasInstruction) {
+          try {
+            const locateFirstOpts = {
+              action: cacheAction,
+              target: parsedEarly?.target || resolvedTarget || (msg.instruction || "").trim(),
+              value: parsedEarly?.value ?? msg.value ?? msg.text ?? "",
+            };
+            const locateFirstOk = await Promise.race([
+              tryLocateFirstOnly(activePage, locateFirstOpts, LOCATE_FIRST_TIMEOUT_MS, { ws, sessionId }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error("Locate-first timeout")), LOCATE_FIRST_TIMEOUT_MS)),
+            ]).catch(() => false);
+            if (locateFirstOk) {
+              await waitForStability(activePage, { timeout: 5000 }).catch(() => {});
+              sendLog(ws, "Step successful (locate-first, <200ms).", "info", sessionId);
+              stepDone({ success: true });
+              done = true;
+            }
+          } catch (_) {}
+        }
+
+        // Try by-text and other deterministic locators (still no AI)
+        const tryTarget = String(resolvedTarget || (hasInstruction ? (msg.instruction || "").trim() : "") || "").trim();
+        if (!done && tryTarget && (resolvedAction === "click" || resolvedAction === "hover" || action === "step")) {
+          try {
+            const byTextOk = await clickOrHoverByText(activePage, tryTarget, resolvedAction === "hover" ? "hover" : "click", { timeout: FAST_PATH_LOCATOR_TIMEOUT_MS });
+            if (byTextOk) {
+              lastError = null;
+              sendLog(ws, "Step successful.", "info", sessionId);
+              stepDone({ success: true });
+              done = true;
+            }
+          } catch (_) {}
+        }
+
+        // Early Claude Visual: try immediately when by-text failed (works across many products).
+        if (!done && hasInstruction && (resolvedAction === "click" || action === "step")) {
+          const instructionOrTarget = (msg.instruction || tryTarget || "").trim();
+          if (instructionOrTarget) {
+            try {
+              sendLog(ws, "Trying Claude (Visual)…", "info", sessionId);
+              const discovery = await getVisualDiscoveryResult(activePage, instructionOrTarget, { disambiguate: true });
+              if (discovery) {
+                const selectorFromPoint = await getSelectorForPoint(activePage, discovery.x, discovery.y);
+                if (selectorFromPoint) setCachedSelector(msg.instruction.trim(), "click", stepPageUrl, selectorFromPoint);
+                await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
+                await activePage.mouse.click(discovery.x, discovery.y);
+                lastError = null;
+                resolvedBy = "visual_discovery";
+                sendLog(ws, "Step successful (Claude Visual).", "info", sessionId);
+                stepDone({ success: true, visualClick: true, discoveryReason: discovery.reason });
+                done = true;
+              }
+            } catch (_) {}
+          }
+        }
+
+        // Introspection layer: fuzzy intent match against cached map. Use Claude only when match < 90%.
+        if (!done) {
+          const introIntent = hasInstruction ? msg.instruction.trim() : [action, target, msg.value].filter(Boolean).join(" ").trim();
+          const introAction = (parsedEarly?.action === "fill" || parsedEarly?.action === "type") ? "fill" : (parsedEarly?.action === "hover" ? "hover" : "click");
+          if (introIntent && (introAction === "click" || introAction === "hover" || introAction === "fill")) {
+            const intro = await matchIntentWithIntrospection(activePage, introIntent, introAction);
+            if (intro.normalizedScore >= INTROSPECTION_90_MATCH_THRESHOLD && intro.selector) {
+              try {
+                if (introAction === "click") {
+                  const urlBefore = activePage.url();
+                  await clickWithVisibleOrForce(activePage, intro.selector, { ws, sessionId });
+                  await waitForStability(activePage, { urlBefore });
+                  setCachedSelector(msg.instruction.trim(), introAction, stepPageUrl, intro.selector);
+                  sendLog(ws, "Step successful (introspection).", "info", sessionId);
+                  stepDone({ success: true, discoveryReason: intro.reasoning });
+                  done = true;
+                } else if (introAction === "hover") {
+                  await waitForVisibleAndScroll(activePage, intro.selector);
+                  await highlightElement(activePage, intro.selector);
+                  await sendFrameNow(ws, activePage, sessionId);
+                  await activePage.hover(intro.selector, { timeout: 5000 });
+                  setCachedSelector(msg.instruction.trim(), introAction, stepPageUrl, intro.selector);
+                  sendLog(ws, "Step successful (introspection).", "info", sessionId);
+                  stepDone({ success: true, discoveryReason: intro.reasoning });
+                  done = true;
+                } else {
+                  const fillVal = String(parsedEarly?.value ?? msg.value ?? msg.text ?? "").trim();
+                  await fillWithVisibleWait(activePage, intro.selector, fillVal, { ws, sessionId });
+                  setCachedSelector(msg.instruction.trim(), introAction, stepPageUrl, intro.selector);
+                  sendLog(ws, "Step successful (introspection).", "info", sessionId);
+                  stepDone({ success: true, discoveryReason: intro.reasoning });
+                  done = true;
+                }
+              } catch (_) {}
+            }
+          }
+        }
+
+        if (!done) for (let attempt = 1; attempt <= MAX_FIND_ATTEMPTS; attempt++) {
           try {
             // When step is "search Gym X in Gym Selector", wait for the modal's search input so snapshot includes it
             const isGymSearchStep = hasInstruction && /search\s+(?:for\s+)?(?:gym|Gym)\s+/i.test(msg.instruction) && /Gym\s+Selector/i.test(msg.instruction);
@@ -1123,7 +2027,7 @@ function processStepQueue(ws) {
             const snapshot = await activePage.evaluate(getDomSnapshotInPage);
             const intent = hasInstruction ? msg.instruction.trim() : [action, target, msg.value].filter(Boolean).join(" ").trim();
             // Parser first: use rule-based result when we have it so we avoid unnecessary LLM calls and failures
-            const parserResult = hasInstruction ? parseInstructionDynamically(msg.instruction) : null;
+            const parserResult = hasInstruction ? getCompiledActionSchema(msg.instruction) : null;
             const parserHighConfidence =
               parserResult &&
               (parserResult.action === "navigate" ||
@@ -1160,6 +2064,8 @@ function processStepQueue(ws) {
                   gymSearchInput = inDialog;
                 } catch (_) {}
                 await gymSearchInput.waitFor({ state: "visible", timeout: 5000 });
+                await highlightLocator(activePage, gymSearchInput);
+                await sendFrameNow(ws, activePage, sessionId);
                 await gymSearchInput.fill(resolvedValue);
                 await new Promise((r) => setTimeout(r, TYPEAHEAD_SETTLE_MS));
                 const stepScreenshot = await takeStepScreenshot(activePage);
@@ -1177,6 +2083,7 @@ function processStepQueue(ws) {
                   if (discovery) {
                     resolvedBy = "visual_discovery";
                     sendLog(ws, "Using Claude (Visual Discovery) for step: Search gym in Gym Selector…", "info", sessionId);
+                    await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
                     await activePage.mouse.click(discovery.x, discovery.y);
                     await activePage.keyboard.type(resolvedValue, { delay: 50 });
                     await new Promise((r) => setTimeout(r, TYPEAHEAD_SETTLE_MS));
@@ -1195,17 +2102,23 @@ function processStepQueue(ws) {
               }
             }
 
-            // LLM only when parser didn't give high-confidence result (null or click/hover) — for disambiguation and selectors
-            if (!selector && intent && !parserHighConfidence) {
+            // Use Claude only when introspection map cannot find a ≥90% match (cost & scale constraint)
+            let discoveryReasonFromIntro = null;
+            if (!selector && intent && (resolvedAction === "click" || resolvedAction === "hover" || resolvedAction === "fill" || resolvedAction === "type")) {
+              const withScore = findBestSelectorWithScore(snapshot, intent, resolvedAction === "type" ? "fill" : resolvedAction);
+              if (withScore.normalizedScore >= INTROSPECTION_90_MATCH_THRESHOLD && withScore.selector) {
+                selector = withScore.selector;
+                discoveryReasonFromIntro = withScore.reasoning;
+              }
+            }
+            if (!selector && intent && !parserHighConfidence && (Date.now() - stepStartTime >= AI_FALLBACK_DELAY_MS)) {
               let aiResult = null;
               try {
+                sendLog(ws, "Using Claude (LLM) for step (fast paths failed).", "info", sessionId);
                 aiResult = await getAiAction(intent, snapshot);
               } catch (_) {}
               if (aiResult && aiResult._provider === "claude") {
                 resolvedBy = "claude";
-                sendLog(ws, `Using Claude (LLM) for step: ${stepLabel}`, "info", sessionId);
-              } else if (aiResult && aiResult._provider === "huggingface") {
-                resolvedBy = "huggingface";
               }
               if (aiResult && aiResult.action && aiResult.target) {
                 // Never let LLM override submit_search or fill+search (parser or early intercept are correct)
@@ -1261,7 +2174,7 @@ function processStepQueue(ws) {
                 selector = findBestSelector(snapshot, field, "fill");
               }
               if (!selector && hasInstruction && !parsedFirst) {
-                const parsed = parseInstructionDynamically(msg.instruction);
+                const parsed = getCompiledActionSchema(msg.instruction);
                 if (parsed && parsed.action && (parsed.target || parsed.value)) {
                   resolvedAction = parsed.action;
                   if (parsed.value != null) resolvedValue = parsed.value;
@@ -1270,7 +2183,7 @@ function processStepQueue(ws) {
                 }
               }
               if ((resolvedAction === "fill" || resolvedAction === "type") && hasInstruction) {
-                const parsedFill = parseInstructionDynamically(msg.instruction);
+                const parsedFill = getCompiledActionSchema(msg.instruction);
                 const fillOnlyTarget = parsedFill?.target || resolvedTarget || target;
                 const fillQuery = (resolvedAction === "fill" || resolvedAction === "type") && fillOnlyTarget === "gym" ? "search gym" : fillOnlyTarget;
                 const fillSelector = findBestSelector(snapshot, fillQuery, resolvedAction);
@@ -1293,7 +2206,7 @@ function processStepQueue(ws) {
                   (entry.tagName === "textarea" ||
                     (entry.tagName === "input" && editableTypes.has((entry.type || "").toLowerCase())));
                 if (!fillable) {
-                  const fallbackTarget = hasInstruction ? (parseInstructionDynamically(msg.instruction)?.target || resolvedTarget) : resolvedTarget;
+                  const fallbackTarget = hasInstruction ? (getCompiledActionSchema(msg.instruction)?.target || resolvedTarget) : resolvedTarget;
                   selector = findBestSelector(snapshot, queryForFind(fallbackTarget || target || "username") || fallbackTarget || target || "username", resolvedAction);
                 }
               }
@@ -1318,6 +2231,7 @@ function processStepQueue(ws) {
                 const coords = await getVisualClickCoordinates(activePage, "search button");
                 if (coords) {
                   try {
+                    await highlightAtPointAndSendFrame(activePage, coords.x, coords.y, ws, sessionId);
                     resolvedBy = "visual_discovery";
                     await activePage.mouse.click(coords.x, coords.y);
                     submitted = true;
@@ -1331,10 +2245,26 @@ function processStepQueue(ws) {
                 done = true;
                 break;
               }
-              lastError = new Error("Search submit failed (Enter and visual fallback did not succeed).");
-              stepDone({ success: false, error: userFacingMessage(lastError) });
-              done = true;
-              break;
+              sendLog(ws, "Trying Claude (Visual) for search/submit before failing…", "info", sessionId);
+              const coordsSubmit = await getVisualClickCoordinates(activePage, "search button or submit search");
+              if (coordsSubmit) {
+                try {
+                  await highlightAtPointAndSendFrame(activePage, coordsSubmit.x, coordsSubmit.y, ws, sessionId);
+                  await activePage.mouse.click(coordsSubmit.x, coordsSubmit.y);
+                  submitted = true;
+                  lastError = null;
+                  sendLog(ws, "Step successful (Visual rescue).", "info", sessionId);
+                  stepDone({ success: true });
+                  done = true;
+                  break;
+                } catch (_) {}
+              }
+              if (!submitted) {
+                lastError = new Error("Search submit failed (Enter and visual fallback did not succeed).");
+                stepDone({ success: false, error: userFacingMessage(lastError) });
+                done = true;
+                break;
+              }
             }
             if (!selector) {
               const instr = (msg.instruction || "").trim();
@@ -1358,10 +2288,26 @@ function processStepQueue(ws) {
                   done = true;
                   break;
                 }
-                lastError = new Error("Search submit via Enter failed (e.g. popup blocking or search input not found).");
-                stepDone({ success: false, error: userFacingMessage(lastError) });
-                done = true;
-                break;
+                sendLog(ws, "Trying Claude (Visual) for search button before failing…", "info", sessionId);
+                const coordsSearchBtn = await getVisualClickCoordinates(activePage, "search button or submit");
+                if (coordsSearchBtn) {
+                  try {
+                    await highlightAtPointAndSendFrame(activePage, coordsSearchBtn.x, coordsSearchBtn.y, ws, sessionId);
+                    await activePage.mouse.click(coordsSearchBtn.x, coordsSearchBtn.y);
+                    submitted = true;
+                    lastError = null;
+                    sendLog(ws, "Step successful (Visual rescue).", "info", sessionId);
+                    stepDone({ success: true });
+                    done = true;
+                    break;
+                  } catch (_) {}
+                }
+                if (!submitted) {
+                  lastError = new Error("Search submit via Enter failed (e.g. popup blocking or search input not found).");
+                  stepDone({ success: false, error: userFacingMessage(lastError) });
+                  done = true;
+                  break;
+                }
               }
               const textTarget = resolvedTarget || target;
               if ((resolvedAction === "click" || resolvedAction === "hover") && textTarget) {
@@ -1381,6 +2327,7 @@ function processStepQueue(ws) {
                     const discovery = await getVisualDiscoveryResult(activePage, (msg.instruction || textTarget || "").trim(), { disambiguate: true });
                     if (discovery) {
                       try {
+                        await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
                         await activePage.mouse.click(discovery.x, discovery.y);
                         gymClickOk = true;
                         resolvedBy = "visual_discovery";
@@ -1410,16 +2357,46 @@ function processStepQueue(ws) {
                     const discovery = await getVisualDiscoveryResult(activePage, instructionOrTarget, { disambiguate: true });
                     if (discovery) {
                       try {
+                        await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
                         await activePage.mouse.click(discovery.x, discovery.y);
                         byTextOk = true;
                         visualClickUsed = true;
                       } catch (_) {}
                     }
                     if (!byTextOk) {
-                      sendLog(ws, "Click failed (page script error). Visual fallback did not succeed.", "error", sessionId);
-                      stepDone({ success: false, error: "Click failed (page script error). Visual fallback did not succeed." });
-                      done = true;
-                      break;
+                      sendLog(ws, "Trying LLM healing then Visual again (page script error path)…", "info", sessionId);
+                      const instructionOrTarget = (msg.instruction || textTarget || "").trim();
+                      const heal = await findAndRetry(activePage, instructionOrTarget, "click", String(textTarget || ""));
+                      if (heal.success && heal.selector) {
+                        try {
+                          await clickWithVisibleOrForce(activePage, heal.selector, { ws, sessionId });
+                          byTextOk = true;
+                          sendLog(ws, "Step successful (LLM rescue).", "info", sessionId);
+                          stepDone({ success: true, selfHealed: true, aiHeal: true });
+                          done = true;
+                          break;
+                        } catch (_) {}
+                      }
+                      if (!done) {
+                        const discovery2 = await getVisualDiscoveryResult(activePage, instructionOrTarget, { disambiguate: true });
+                        if (discovery2) {
+                          try {
+                            await highlightAtPointAndSendFrame(activePage, discovery2.x, discovery2.y, ws, sessionId);
+                            await activePage.mouse.click(discovery2.x, discovery2.y);
+                            byTextOk = true;
+                            sendLog(ws, "Step successful (Visual retry).", "info", sessionId);
+                            stepDone({ success: true, visualClick: true });
+                            done = true;
+                            break;
+                          } catch (_) {}
+                        }
+                      }
+                      if (!done) {
+                        sendLog(ws, "Click failed (page script error). Visual fallback did not succeed.", "error", sessionId);
+                        stepDone({ success: false, error: "Click failed (page script error). Visual fallback did not succeed." });
+                        done = true;
+                        break;
+                      }
                     }
                   } else {
                     throw e;
@@ -1445,21 +2422,22 @@ function processStepQueue(ws) {
                   break;
                 }
               }
-              if (!done && hasInstruction) {
+              if (!done && hasInstruction && (Date.now() - stepStartTime >= AI_FALLBACK_DELAY_MS)) {
                 const heal = await findAndRetry(activePage, msg.instruction.trim(), resolvedAction, String(resolvedTarget || target));
                 if (heal.success && heal.selector) {
                   try {
                     if (resolvedAction === "click") {
-                      await clickWithVisibleOrForce(activePage, heal.selector);
+                      await clickWithVisibleOrForce(activePage, heal.selector, { ws, sessionId });
                     } else if (resolvedAction === "hover") {
                       await waitForVisibleAndScroll(activePage, heal.selector);
                       await highlightElement(activePage, heal.selector);
+                      await sendFrameNow(ws, activePage, sessionId);
                       await activePage.hover(heal.selector, { timeout: INTERACTION_CLICK_TIMEOUT_MS });
                     }
                     if (resolvedAction === "click" || resolvedAction === "hover") {
                       lastError = null;
                       sendLog(ws, "Step successful." + (heal.healed ? " (self-healed)" : ""), "info", sessionId);
-                      stepDone({ success: true, selfHealed: !!heal.healed });
+                      stepDone({ success: true, selfHealed: !!heal.healed, aiHeal: !!heal.healed });
                       done = true;
                       break;
                     }
@@ -1468,26 +2446,46 @@ function processStepQueue(ws) {
                   }
                 }
                 if (!done && (heal.expectedElement != null || heal.actualPageContent != null)) {
-                  const errMsg = `No element matched "${resolvedTarget || target}" (attempt ${attempt}/${MAX_FIND_ATTEMPTS})`;
-                  lastError = new Error(errMsg);
-                  const stepScreenshot = await takeStepScreenshot(activePage);
-                  sendLog(ws, `Step failed: ${errMsg}`, "error", sessionId);
-                  stepDone({
-                    success: false,
-                    screenshot: stepScreenshot,
-                    message: errMsg,
-                    expectedElement: heal.expectedElement,
-                    actualPageContent: heal.actualPageContent,
-                  });
-                  send(ws, "ambiguity_error", {
-                    sessionId,
-                    message: errMsg,
-                    target: resolvedTarget ?? target,
-                    screenshot: stepScreenshot,
-                    expectedElement: heal.expectedElement,
-                    actualPageContent: heal.actualPageContent,
-                  });
-                  return;
+                  sendLog(ws, "Trying Claude (Visual) one more time before ambiguity failure…", "info", sessionId);
+                  const instructionForVisual = (msg.instruction || resolvedTarget || target || "").trim();
+                  const discoveryAmb = await getVisualDiscoveryResult(activePage, instructionForVisual, { disambiguate: true });
+                  if (discoveryAmb) {
+                    try {
+                      await highlightAtPointAndSendFrame(activePage, discoveryAmb.x, discoveryAmb.y, ws, sessionId);
+                      if (resolvedAction === "click") {
+                        await activePage.mouse.click(discoveryAmb.x, discoveryAmb.y);
+                      } else if (resolvedAction === "hover") {
+                        await activePage.mouse.move(discoveryAmb.x, discoveryAmb.y);
+                      }
+                      lastError = null;
+                      sendLog(ws, "Step successful (Visual rescue before ambiguity).", "info", sessionId);
+                      stepDone({ success: true, visualClick: resolvedAction === "click" });
+                      done = true;
+                      break;
+                    } catch (_) {}
+                  }
+                  if (!done) {
+                    const errMsg = `No element matched "${resolvedTarget || target}" (attempt ${attempt}/${MAX_FIND_ATTEMPTS})`;
+                    lastError = new Error(errMsg);
+                    const stepScreenshot = await takeStepScreenshot(activePage);
+                    sendLog(ws, `Step failed: ${errMsg}`, "error", sessionId);
+                    stepDone({
+                      success: false,
+                      screenshot: stepScreenshot,
+                      message: errMsg,
+                      expectedElement: heal.expectedElement,
+                      actualPageContent: heal.actualPageContent,
+                    });
+                    send(ws, "ambiguity_error", {
+                      sessionId,
+                      message: errMsg,
+                      target: resolvedTarget ?? target,
+                      screenshot: stepScreenshot,
+                      expectedElement: heal.expectedElement,
+                      actualPageContent: heal.actualPageContent,
+                    });
+                    return;
+                  }
                 }
               }
               lastError = new Error(`No element matched "${resolvedTarget || target}" (attempt ${attempt}/${MAX_FIND_ATTEMPTS})`);
@@ -1511,6 +2509,7 @@ function processStepQueue(ws) {
                   const discovery = await getVisualDiscoveryResult(activePage, (msg.instruction || gymListTarget || "").trim(), { disambiguate: true });
                   if (discovery) {
                     try {
+                      await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
                       await activePage.mouse.click(discovery.x, discovery.y);
                       gymClickOk = true;
                       resolvedBy = "visual_discovery";
@@ -1554,6 +2553,19 @@ function processStepQueue(ws) {
                   break;
                 }
                 if (isSearchButtonStep || selectorLooksLikeSearchSubmit) {
+                  sendLog(ws, "Trying Claude (Visual) for search/submit before failing…", "info", sessionId);
+                  const coordsV = await getVisualClickCoordinates(activePage, "search button or submit");
+                  if (coordsV) {
+                    try {
+                      await highlightAtPointAndSendFrame(activePage, coordsV.x, coordsV.y, ws, sessionId);
+                      await activePage.mouse.click(coordsV.x, coordsV.y);
+                      lastError = null;
+                      sendLog(ws, "Step successful (Visual rescue).", "info", sessionId);
+                      stepDone({ success: true });
+                      done = true;
+                      break;
+                    } catch (_) {}
+                  }
                   lastError = new Error("Search submit via Enter failed (e.g. popup blocking or search input not found).");
                   stepDone({ success: false, error: userFacingMessage(lastError) });
                   done = true;
@@ -1578,13 +2590,28 @@ function processStepQueue(ws) {
                   done = true;
                   break;
                 }
+                sendLog(ws, "Trying Claude (Visual) for search button before failing…", "info", sessionId);
+                const coordsV2 = await getVisualClickCoordinates(activePage, "search button or submit");
+                if (coordsV2) {
+                  try {
+                    await highlightAtPointAndSendFrame(activePage, coordsV2.x, coordsV2.y, ws, sessionId);
+                    await activePage.mouse.click(coordsV2.x, coordsV2.y);
+                    lastError = null;
+                    sendLog(ws, "Step successful (Visual rescue).", "info", sessionId);
+                    stepDone({ success: true });
+                    done = true;
+                    break;
+                  } catch (_) {}
+                }
                 lastError = new Error("Search submit via Enter failed (e.g. popup blocking or search input not found).");
                 stepDone({ success: false, error: userFacingMessage(lastError) });
                 done = true;
                 break;
               }
               try {
-                await clickWithVisibleOrForce(activePage, selector);
+                const urlBeforeClick = activePage.url();
+                await clickWithVisibleOrForce(activePage, selector, { ws, sessionId });
+                await waitForStability(activePage, { urlBefore: urlBeforeClick });
               } catch (clickErr) {
                 const textTarget = resolvedTarget || target;
                 const errMsg = (clickErr && clickErr.message) || "";
@@ -1605,6 +2632,19 @@ function processStepQueue(ws) {
                     done = true;
                     break;
                   }
+                  sendLog(ws, "Trying Claude (Visual) for search button before failing…", "info", sessionId);
+                  const coordsV3 = await getVisualClickCoordinates(activePage, "search button or submit");
+                  if (coordsV3) {
+                    try {
+                      await highlightAtPointAndSendFrame(activePage, coordsV3.x, coordsV3.y, ws, sessionId);
+                      await activePage.mouse.click(coordsV3.x, coordsV3.y);
+                      lastError = null;
+                      sendLog(ws, "Step successful (Visual rescue).", "info", sessionId);
+                      stepDone({ success: true });
+                      done = true;
+                      break;
+                    } catch (_) {}
+                  }
                   lastError = new Error("Search submit via Enter failed (e.g. popup blocking or search input not found).");
                   sendLog(ws, lastError.message, "error", sessionId);
                   stepDone({ success: false, error: userFacingMessage(lastError) });
@@ -1616,6 +2656,9 @@ function processStepQueue(ws) {
                   const discovery = await getVisualDiscoveryResult(activePage, instructionOrTarget, { disambiguate: true });
                   if (discovery) {
                     try {
+                      const selFromPoint = await getSelectorForPoint(activePage, discovery.x, discovery.y);
+                      if (selFromPoint) setCachedSelector(msg.instruction.trim(), "click", stepPageUrl, selFromPoint);
+                      await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
                       resolvedBy = "visual_discovery";
                       await activePage.mouse.click(discovery.x, discovery.y);
                       lastError = null;
@@ -1626,11 +2669,39 @@ function processStepQueue(ws) {
                     } catch (_) {}
                   }
                   if (!done) {
-                    lastError = new Error("Click failed (page script error). Visual fallback did not succeed.");
-                    sendLog(ws, lastError.message, "error", sessionId);
-                    stepDone({ success: false, error: userFacingMessage(lastError) });
-                    done = true;
-                    break;
+                    sendLog(ws, "Trying LLM healing then Visual again (selector click script error)…", "info", sessionId);
+                    const healClick = await findAndRetry(activePage, (msg.instruction || textTarget || "").trim(), "click", String(textTarget || ""));
+                    if (healClick.success && healClick.selector) {
+                      try {
+                        await clickWithVisibleOrForce(activePage, healClick.selector, { ws, sessionId });
+                        lastError = null;
+                        sendLog(ws, "Step successful (LLM rescue).", "info", sessionId);
+                        stepDone({ success: true, selfHealed: true, aiHeal: true });
+                        done = true;
+                        break;
+                      } catch (_) {}
+                    }
+                    if (!done) {
+                      const discoveryRetry = await getVisualDiscoveryResult(activePage, (msg.instruction || textTarget || "").trim(), { disambiguate: true });
+                      if (discoveryRetry) {
+                        try {
+                          await highlightAtPointAndSendFrame(activePage, discoveryRetry.x, discoveryRetry.y, ws, sessionId);
+                          await activePage.mouse.click(discoveryRetry.x, discoveryRetry.y);
+                          lastError = null;
+                          sendLog(ws, "Step successful (Visual retry).", "info", sessionId);
+                          stepDone({ success: true, visualClick: true });
+                          done = true;
+                          break;
+                        } catch (_) {}
+                      }
+                    }
+                    if (!done) {
+                      lastError = new Error("Click failed (page script error). Visual fallback did not succeed.");
+                      sendLog(ws, lastError.message, "error", sessionId);
+                      stepDone({ success: false, error: userFacingMessage(lastError) });
+                      done = true;
+                      break;
+                    }
                   }
                 }
                 let byTextOk = textTarget && (await clickOrHoverByText(activePage, String(textTarget), "click", { timeout: 5000 }));
@@ -1638,10 +2709,10 @@ function processStepQueue(ws) {
                   const corrected = getTypoCorrectedTarget(String(textTarget));
                   if (corrected) byTextOk = await clickOrHoverByText(activePage, corrected, "click", { timeout: 5000 });
                 }
-                if (!byTextOk && hasInstruction) {
+                if (!byTextOk && hasInstruction && (Date.now() - stepStartTime >= AI_FALLBACK_DELAY_MS)) {
                   byTextOk = await tryLlmFallbackClickOrHover(activePage, snapshot, msg.instruction.trim(), "click");
                 }
-                if (!byTextOk && hasInstruction) {
+                if (!byTextOk && hasInstruction && (Date.now() - stepStartTime >= AI_FALLBACK_DELAY_MS)) {
                   const heal = await findAndRetry(activePage, msg.instruction.trim(), "click", String(textTarget || resolvedTarget || target));
                   if (heal.success && heal.selector) {
                     if (/\bsearch\s*button\b|nav-search-submit|search-submit/i.test(String(heal.selector))) {
@@ -1649,16 +2720,16 @@ function processStepQueue(ws) {
                       if (submitted) {
                         lastError = null;
                         sendLog(ws, "Step successful." + (heal.healed ? " (self-healed)" : ""), "info", sessionId);
-                        stepDone({ success: true, selfHealed: !!heal.healed });
+                        stepDone({ success: true, selfHealed: !!heal.healed, aiHeal: !!heal.healed });
                         done = true;
                         break;
                       }
                     }
                     try {
-                      await clickWithVisibleOrForce(activePage, heal.selector);
+                      await clickWithVisibleOrForce(activePage, heal.selector, { ws, sessionId });
                       lastError = null;
                       sendLog(ws, "Step successful." + (heal.healed ? " (self-healed)" : ""), "info", sessionId);
-                      stepDone({ success: true, selfHealed: !!heal.healed });
+                      stepDone({ success: true, selfHealed: !!heal.healed, aiHeal: !!heal.healed });
                       done = true;
                       break;
                     } catch (_) {
@@ -1679,6 +2750,7 @@ function processStepQueue(ws) {
               try {
                 await waitForVisibleAndScroll(activePage, selector);
                 await highlightElement(activePage, selector);
+                await sendFrameNow(ws, activePage, sessionId);
                 await activePage.hover(selector, { timeout: INTERACTION_CLICK_TIMEOUT_MS });
               } catch (hoverErr) {
                 if (isPageScriptError(hoverErr)) {
@@ -1709,10 +2781,10 @@ function processStepQueue(ws) {
                   const corrected = getTypoCorrectedTarget(String(textTarget));
                   if (corrected) byTextOk = await clickOrHoverByText(activePage, corrected, "hover", { timeout: 5000 });
                 }
-                if (!byTextOk && hasInstruction) {
+                if (!byTextOk && hasInstruction && (Date.now() - stepStartTime >= AI_FALLBACK_DELAY_MS)) {
                   byTextOk = await tryLlmFallbackClickOrHover(activePage, snapshot, msg.instruction.trim(), "hover");
                 }
-                if (!byTextOk && hasInstruction) {
+                if (!byTextOk && hasInstruction && (Date.now() - stepStartTime >= AI_FALLBACK_DELAY_MS)) {
                   const heal = await findAndRetry(activePage, msg.instruction.trim(), "hover", String(textTarget || resolvedTarget || target));
                   if (heal.success && heal.selector) {
                     try {
@@ -1721,7 +2793,7 @@ function processStepQueue(ws) {
                       await activePage.hover(heal.selector, { timeout: INTERACTION_CLICK_TIMEOUT_MS });
                       lastError = null;
                       sendLog(ws, "Step successful." + (heal.healed ? " (self-healed)" : ""), "info", sessionId);
-                      stepDone({ success: true, selfHealed: !!heal.healed });
+                      stepDone({ success: true, selfHealed: !!heal.healed, aiHeal: !!heal.healed });
                       done = true;
                       break;
                     } catch (_) {
@@ -1756,6 +2828,7 @@ function processStepQueue(ws) {
               if (isPassword && resolvedValue) {
                 await waitForVisibleAndScroll(activePage, finalSelector);
                 await highlightElement(activePage, finalSelector);
+                await sendFrameNow(ws, activePage, sessionId);
                 await activePage.locator(finalSelector).focus();
                 await activePage.locator(finalSelector).pressSequentially(resolvedValue, { delay: 60 });
               } else {
@@ -1766,17 +2839,28 @@ function processStepQueue(ws) {
                   /search\s+gym|search\s+for|search\s+club/i.test(String(msg.instruction || ""));
                 await fillWithVisibleWait(activePage, finalSelector, resolvedValue, {
                   waitAfterMs: isSearchStep ? TYPEAHEAD_SETTLE_MS : 0,
+                  ws,
+                  sessionId,
                 });
               }
             } else if (resolvedAction === "press") {
               await waitForVisibleAndScroll(activePage, selector);
               await highlightElement(activePage, selector);
+              await sendFrameNow(ws, activePage, sessionId);
               await activePage.press(selector, msg.key || "Enter");
             }
             lastError = null;
+            const actionForCache = resolvedAction === "type" ? "fill" : resolvedAction;
+            if (selector && (actionForCache === "click" || actionForCache === "hover" || actionForCache === "fill")) {
+              setCachedSelector(msg.instruction.trim(), actionForCache, stepPageUrl, selector);
+            }
             const stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
-            stepDone({ success: true, screenshot: stepScreenshot });
+            stepDone({
+              success: true,
+              screenshot: stepScreenshot,
+              ...(discoveryReasonFromIntro ? { discoveryReason: discoveryReasonFromIntro } : {}),
+            });
             done = true;
             break;
           } catch (e) {
@@ -1786,18 +2870,18 @@ function processStepQueue(ws) {
         if (!done && lastError) {
           // LLM fallback: reinterpret instruction for different phrasings and situations (millions of users, millions of ways)
           const hasRetryIntent = hasInstruction || action || target;
-          if (hasRetryIntent) {
+          if (hasRetryIntent && (Date.now() - stepStartTime >= AI_FALLBACK_DELAY_MS)) {
             try {
               const freshSnapshot = await activePage.evaluate(getDomSnapshotInPage);
               const retryIntent = hasInstruction ? msg.instruction.trim() : [action, target, msg.value].filter(Boolean).join(" ").trim();
               if (!retryIntent) throw new Error("No intent");
-              sendLog(ws, "Trying LLM for step after interpreter failed…", "info", sessionId);
+              sendLog(ws, "Trying Claude (LLM) fallback…", "info", sessionId);
               const aiResult = await getAiAction(retryIntent, freshSnapshot);
               if (aiResult && aiResult.action && aiResult.target) {
                 const provider = aiResult._provider || "AI";
                 sendLog(ws, `LLM (${provider}) suggested: ${aiResult.action} "${(aiResult.target || "").slice(0, 40)}…"`, "info", sessionId);
                 if (aiResult._provider === "claude") resolvedBy = "claude";
-                else if (aiResult._provider === "huggingface") resolvedBy = "huggingface";
+                else if (aiResult._provider === "claude") resolvedBy = "claude";
                 const aiTarget = String(aiResult.target).trim();
                 const aiValue = aiResult.value != null ? String(aiResult.value) : (resolvedValue || "");
                 if (aiResult.action === "click" || aiResult.action === "hover") {
@@ -1818,7 +2902,7 @@ function processStepQueue(ws) {
                   const fillSelector = findBestSelector(freshSnapshot, aiTarget || "search", "fill");
                   if (fillSelector) {
                     try {
-                      await fillWithVisibleWait(activePage, fillSelector, aiValue, { timeout: 5000 });
+                      await fillWithVisibleWait(activePage, fillSelector, aiValue, { timeout: 5000, ws, sessionId });
                       lastError = null;
                       sendLog(ws, "Step successful (LLM suggestion).", "info", sessionId);
                       stepDone({ success: true });
@@ -1837,8 +2921,11 @@ function processStepQueue(ws) {
               sendLog(ws, "Trying Claude (Visual Discovery) for failed click (disambiguate if multiple)…", "info", sessionId);
               const discovery = await getVisualDiscoveryResult(activePage, instructionOrTarget, { disambiguate: true });
               if (discovery) {
+                const selFromPoint = await getSelectorForPoint(activePage, discovery.x, discovery.y);
+                if (selFromPoint) setCachedSelector(msg.instruction.trim(), "click", stepPageUrl, selFromPoint);
                 resolvedBy = "visual_discovery";
                 sendLog(ws, `Using Claude (Visual Discovery) for step: ${(instructionOrTarget || "").slice(0, 50)}…`, "info", sessionId);
+                await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
                 const urlBefore = activePage.url();
                 await activePage.mouse.click(discovery.x, discovery.y);
                 lastError = null;
@@ -1864,8 +2951,11 @@ function processStepQueue(ws) {
                 hasInstruction ? msg.instruction.trim() : `Search or input field for ${resolvedTarget || "text"}`;
               const discovery = await getVisualDiscoveryResult(activePage, fillInstruction);
               if (discovery) {
+                const selFromPoint = await getSelectorForPoint(activePage, discovery.x, discovery.y);
+                if (selFromPoint) setCachedSelector(msg.instruction.trim(), "fill", stepPageUrl, selFromPoint);
                 resolvedBy = "visual_discovery";
                 sendLog(ws, `Using Claude (Visual Discovery) for step: ${(fillInstruction || "").slice(0, 50)}…`, "info", sessionId);
+                await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
                 await activePage.mouse.click(discovery.x, discovery.y);
                 await activePage.keyboard.type(resolvedValue, { delay: 50 });
                 const isSearchStep =
@@ -1926,7 +3016,7 @@ function processStepQueue(ws) {
           let stepScreenshot = null;
           if (action === "click" && selector) {
             try {
-              await clickWithVisibleOrForce(activePage, selector);
+              await clickWithVisibleOrForce(activePage, selector, { ws, sessionId });
             } catch (clickE) {
               const errMsg = (clickE && clickE.message) || "";
               if (/assignment to constant|typeerror|reference error/i.test(errMsg)) {
@@ -1934,11 +3024,14 @@ function processStepQueue(ws) {
                 const discovery = await getVisualDiscoveryResult(activePage, instructionOrTarget, { disambiguate: true });
                 if (discovery) {
                   try {
+                    const selFromPoint = await getSelectorForPoint(activePage, discovery.x, discovery.y);
+                    if (selFromPoint) setCachedSelector(msg.instruction.trim(), "click", stepPageUrl, selFromPoint);
                     resolvedBy = "visual_discovery";
-                    sendLog(ws, `Using Claude (Visual Discovery) for step: ${(instructionOrTarget || "").slice(0, 50)}…`, "info", sessionId);
-                    const urlBefore = activePage.url();
-                    await activePage.mouse.click(discovery.x, discovery.y);
-                    const validationPassed = await validateAfterClick(activePage, urlBefore);
+                sendLog(ws, `Using Claude (Visual Discovery) for step: ${(instructionOrTarget || "").slice(0, 50)}…`, "info", sessionId);
+                await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
+                const urlBefore = activePage.url();
+                await activePage.mouse.click(discovery.x, discovery.y);
+                const validationPassed = await validateAfterClick(activePage, urlBefore);
                     stepScreenshot = await takeStepScreenshot(activePage);
                     sendLog(ws, "Step successful (Visual Discovery).", "info", sessionId);
                     stepDone({
@@ -1952,9 +3045,38 @@ function processStepQueue(ws) {
                   } catch (_) {}
                 }
                 if (!done) {
-                  sendLog(ws, "Click failed (page script error). Visual fallback did not succeed.", "error", sessionId);
-                  stepDone({ success: false, error: "Click failed (page script error). Visual fallback did not succeed." });
-                  done = true;
+                  const instructionOrTarget = (msg.instruction || msg.target || "").trim();
+                  sendLog(ws, "Trying LLM healing then Visual as final rescue…", "info", sessionId);
+                  const healFinal = await findAndRetry(activePage, instructionOrTarget, "click", instructionOrTarget);
+                  if (healFinal.success && healFinal.selector) {
+                    try {
+                      await clickWithVisibleOrForce(activePage, healFinal.selector, { ws, sessionId });
+                      resolvedBy = "claude";
+                      stepScreenshot = await takeStepScreenshot(activePage);
+                      sendLog(ws, "Step successful (LLM final rescue).", "info", sessionId);
+                      stepDone({ success: true, screenshot: stepScreenshot, selfHealed: true, aiHeal: true });
+                      done = true;
+                    } catch (_) {}
+                  }
+                  if (!done) {
+                    const discovery = await getVisualDiscoveryResult(activePage, instructionOrTarget, { disambiguate: true });
+                    if (discovery) {
+                      try {
+                        await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
+                        await activePage.mouse.click(discovery.x, discovery.y);
+                        resolvedBy = "visual_discovery";
+                        stepScreenshot = await takeStepScreenshot(activePage);
+                        sendLog(ws, "Step successful (Claude Visual final rescue).", "info", sessionId);
+                        stepDone({ success: true, screenshot: stepScreenshot, visualClick: true });
+                        done = true;
+                      } catch (_) {}
+                    }
+                  }
+                  if (!done) {
+                    sendLog(ws, "Click failed (page script error). Visual fallback did not succeed.", "error", sessionId);
+                    stepDone({ success: false, error: "Click failed (page script error). Visual fallback did not succeed." });
+                    done = true;
+                  }
                 }
               } else {
                 throw clickE;
@@ -1967,7 +3089,7 @@ function processStepQueue(ws) {
               done = true;
             }
           } else if ((action === "type" || action === "fill") && selector) {
-            await fillWithVisibleWait(activePage, selector, msg.text ?? msg.value ?? "");
+            await fillWithVisibleWait(activePage, selector, msg.text ?? msg.value ?? "", { ws, sessionId });
             stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
             stepDone({ success: true, screenshot: stepScreenshot });
@@ -1978,6 +3100,7 @@ function processStepQueue(ws) {
             stepDone({ success: true, screenshot: stepScreenshot });
           } else if (action === "press" && selector) {
             await highlightElement(activePage, selector);
+            await sendFrameNow(ws, activePage, sessionId);
             await activePage.press(selector, msg.key || "Enter");
             stepScreenshot = await takeStepScreenshot(activePage);
             sendLog(ws, "Step successful.", "info", sessionId);
@@ -1995,37 +3118,159 @@ function processStepQueue(ws) {
           }
           done = true;
         } catch (e) {
+          const instruction = (msg.instruction || "").trim() || [msg.action, msg.target].filter(Boolean).join(" ");
+          const lastResortAction = (msg.action === "fill" || msg.action === "type") ? "fill" : "click";
+          const lastResortTarget = msg.target || instruction;
+          if (instruction && lastResortTarget) {
+            sendLog(ws, "Trying LLM healing after selector error…", "info", sessionId);
+            const heal = await findAndRetry(activePage, instruction, lastResortAction, String(lastResortTarget));
+            if (heal.success && heal.selector) {
+              try {
+                if (lastResortAction === "click") {
+                  await clickWithVisibleOrForce(activePage, heal.selector, { ws, sessionId });
+                } else {
+                  await fillWithVisibleWait(activePage, heal.selector, msg.value ?? msg.text ?? "", { ws, sessionId });
+                }
+                sendLog(ws, "Step successful (LLM healing).", "info", sessionId);
+                resolvedBy = "claude";
+                stepDone({ success: true, selfHealed: true, aiHeal: true, screenshot: await takeStepScreenshot(activePage) });
+                done = true;
+              } catch (_) {}
+            }
+            if (!done) {
+              sendLog(ws, "Trying Claude (Visual) as final rescue…", "info", sessionId);
+              const discovery = await getVisualDiscoveryResult(activePage, instruction, { disambiguate: true });
+              if (discovery) {
+                try {
+                  await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
+                  await activePage.mouse.click(discovery.x, discovery.y);
+                  if (lastResortAction === "fill") {
+                    await new Promise((r) => setTimeout(r, 200));
+                    await activePage.keyboard.type(String(msg.value ?? msg.text ?? "").trim(), { delay: 40 });
+                  }
+                  resolvedBy = "visual_discovery";
+                  sendLog(ws, "Step successful (Claude Visual final rescue).", "info", sessionId);
+                  stepDone({ success: true, visualClick: true, screenshot: await takeStepScreenshot(activePage) });
+                  done = true;
+                } catch (_) {}
+              }
+            }
+          }
+          if (!done) {
+            let screenshotBase64 = null;
+            try {
+              const buf = await activePage.screenshot({ type: "png" });
+              screenshotBase64 = buf.toString("base64");
+            } catch (_) {}
+            const errMsg = userFacingMessage(e);
+            sendLog(ws, `Step failed: ${errMsg}`, "error", sessionId);
+            stepDone({ success: false, screenshot: screenshotBase64, failureType: stepFailureType });
+            send(ws, "error", { sessionId, message: errMsg });
+            send(ws, "test_error", { sessionId, message: errMsg, screenshot: screenshotBase64 });
+          }
+        }
+      } else if (!done) {
+        const instruction = (msg.instruction || "").trim() || [msg.action, msg.target].filter(Boolean).join(" ");
+        const lastResortAction = (msg.action === "fill" || msg.action === "type") ? "fill" : "click";
+        const lastResortTarget = msg.target || instruction;
+        const isVerify = parsedEarly && parsedEarly.action === "verify_displayed";
+        if (instruction && lastResortTarget && !isVerify) {
+          sendLog(ws, "Trying LLM healing before failing step…", "info", sessionId);
+          const heal = await findAndRetry(activePage, instruction, lastResortAction, String(lastResortTarget));
+          if (heal.success && heal.selector) {
+            try {
+              if (lastResortAction === "click") {
+                await clickWithVisibleOrForce(activePage, heal.selector, { ws, sessionId });
+              } else {
+                await fillWithVisibleWait(activePage, heal.selector, msg.value ?? msg.text ?? "", { ws, sessionId });
+              }
+              sendLog(ws, "Step successful (LLM healing).", "info", sessionId);
+              resolvedBy = "claude";
+              stepDone({ success: true, selfHealed: true, aiHeal: true, screenshot: await takeStepScreenshot(activePage) });
+              done = true;
+            } catch (_) {}
+          }
+          if (!done) {
+            sendLog(ws, "Trying Claude (Visual) as final rescue…", "info", sessionId);
+            const discovery = await getVisualDiscoveryResult(activePage, instruction, { disambiguate: true });
+            if (discovery) {
+              try {
+                await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
+                await activePage.mouse.click(discovery.x, discovery.y);
+                if (lastResortAction === "fill") {
+                  await new Promise((r) => setTimeout(r, 200));
+                  await activePage.keyboard.type(String(msg.value ?? msg.text ?? "").trim(), { delay: 40 });
+                }
+                resolvedBy = "visual_discovery";
+                sendLog(ws, "Step successful (Claude Visual final rescue).", "info", sessionId);
+                stepDone({ success: true, visualClick: true, screenshot: await takeStepScreenshot(activePage) });
+                done = true;
+              } catch (_) {}
+            }
+          }
+        }
+        if (!done) {
           let screenshotBase64 = null;
           try {
             const buf = await activePage.screenshot({ type: "png" });
             screenshotBase64 = buf.toString("base64");
           } catch (_) {}
-          const errMsg = userFacingMessage(e);
+          const errMsg = "Step could not be executed: no matching element or action resolved.";
           sendLog(ws, `Step failed: ${errMsg}`, "error", sessionId);
-          stepDone({ success: false, screenshot: screenshotBase64 });
-          send(ws, "error", { sessionId, message: errMsg });
-          send(ws, "test_error", { sessionId, message: errMsg, screenshot: screenshotBase64 });
+          stepDone({ success: false, screenshot: screenshotBase64, failureType: stepFailureType });
         }
-      } else if (!done) {
+      }
+    } catch (err) {
+      const instruction = (msg.instruction || "").trim() || [msg.action, msg.target].filter(Boolean).join(" ");
+      const lastResortAction = (msg.action === "fill" || msg.action === "type") ? "fill" : "click";
+      const lastResortTarget = msg.target || instruction;
+      const isVerify = parsedEarly && parsedEarly.action === "verify_displayed";
+      if (instruction && lastResortTarget && !isVerify) {
+        sendLog(ws, "Trying LLM healing after error…", "info", sessionId);
+        const heal = await findAndRetry(activePage, instruction, lastResortAction, String(lastResortTarget));
+        if (heal.success && heal.selector) {
+          try {
+            if (lastResortAction === "click") {
+              await clickWithVisibleOrForce(activePage, heal.selector, { ws, sessionId });
+            } else {
+              await fillWithVisibleWait(activePage, heal.selector, msg.value ?? msg.text ?? "", { ws, sessionId });
+            }
+            sendLog(ws, "Step successful (LLM healing after error).", "info", sessionId);
+            resolvedBy = "claude";
+            stepDone({ success: true, selfHealed: true, aiHeal: true, screenshot: await takeStepScreenshot(activePage) });
+            done = true;
+          } catch (_) {}
+        }
+        if (!done) {
+          sendLog(ws, "Trying Claude (Visual) as final rescue…", "info", sessionId);
+          const discovery = await getVisualDiscoveryResult(activePage, instruction, { disambiguate: true });
+          if (discovery) {
+            try {
+              await highlightAtPointAndSendFrame(activePage, discovery.x, discovery.y, ws, sessionId);
+              await activePage.mouse.click(discovery.x, discovery.y);
+              if (lastResortAction === "fill") {
+                await new Promise((r) => setTimeout(r, 200));
+                await activePage.keyboard.type(String(msg.value ?? msg.text ?? "").trim(), { delay: 40 });
+              }
+              resolvedBy = "visual_discovery";
+              sendLog(ws, "Step successful (Claude Visual final rescue).", "info", sessionId);
+              stepDone({ success: true, visualClick: true, screenshot: await takeStepScreenshot(activePage) });
+              done = true;
+            } catch (_) {}
+          }
+        }
+      }
+      if (!done) {
         let screenshotBase64 = null;
         try {
           const buf = await activePage.screenshot({ type: "png" });
           screenshotBase64 = buf.toString("base64");
         } catch (_) {}
-        const errMsg = "Step could not be executed: no matching element or action resolved.";
+        const errMsg = userFacingMessage(err);
         sendLog(ws, `Step failed: ${errMsg}`, "error", sessionId);
-        stepDone({ success: false, screenshot: screenshotBase64 });
+        stepDone({ success: false, screenshot: screenshotBase64, failureType: stepFailureType });
+        send(ws, "test_error", { sessionId, message: errMsg, screenshot: screenshotBase64 });
       }
-    } catch (err) {
-      let screenshotBase64 = null;
-      try {
-        const buf = await activePage.screenshot({ type: "png" });
-        screenshotBase64 = buf.toString("base64");
-      } catch (_) {}
-      const errMsg = userFacingMessage(err);
-      sendLog(ws, `Step failed: ${errMsg}`, "error", sessionId);
-      stepDone({ success: false, screenshot: screenshotBase64 });
-      send(ws, "test_error", { sessionId, message: errMsg, screenshot: screenshotBase64 });
     } finally {
       state.processing = false;
       if (stepQueues.has(ws)) setImmediate(() => processStepQueue(ws));

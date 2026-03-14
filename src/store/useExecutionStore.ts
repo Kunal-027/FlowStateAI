@@ -39,6 +39,8 @@ export interface ExecutionState {
     screenshot?: string;
     resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
   }>) | null;
+  /** Screenshots per page (after each navigation); for reports. */
+  pageScreenshots: { url: string; screenshot: string }[];
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -53,6 +55,8 @@ export interface ExecutionActions {
     updates: Partial<TestStep>
   ) => void;
   addStep: (testCaseId: string, instruction?: string) => void;
+  /** Insert a new step after the step with the given order (0-based). Use afterOrder -1 to insert at start. */
+  insertStep: (testCaseId: string, afterOrder: number, instruction?: string) => void;
   deleteStep: (testCaseId: string, stepId: string) => void;
   setActiveTestCase: (id: string | null) => void;
   setActiveStep: (id: string | null) => void;
@@ -75,6 +79,8 @@ export interface ExecutionActions {
     screenshot?: string;
     resolvedBy?: "interpreter" | "huggingface" | "claude" | "visual_discovery";
   }>) | null) => void;
+  addPageScreenshot: (entry: { url: string; screenshot: string }) => void;
+  clearPageScreenshots: () => void;
   /** Reset store to initial state */
   reset: () => void;
 }
@@ -98,6 +104,7 @@ const defaultState: ExecutionState = {
   stepDelayMs: 1000,
   bridgeSend: null,
   executeStep: null,
+  pageScreenshots: [],
 };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -165,6 +172,30 @@ const store = create<ExecutionState & ExecutionActions>(
         };
       }),
 
+    /** Inserts a new step after the step with order === afterOrder. New step gets order afterOrder+1; later steps shift. Use afterOrder -1 to insert at start (new step order 0). */
+    insertStep: (testCaseId, afterOrder, instruction = "") =>
+      set((state) => {
+        const newStep: TestStep = {
+          id: `step-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+          instruction,
+          payload: parseSingleInstruction(instruction),
+          status: "idle",
+          order: afterOrder + 1,
+          healingAttempts: 0,
+          retryCount: 0,
+        };
+        return {
+          testCases: state.testCases.map((tc) => {
+            if (tc.id !== testCaseId) return tc;
+            const steps = tc.steps
+              .map((s) => (s.order > afterOrder ? { ...s, order: s.order + 1 } : s))
+              .concat([newStep])
+              .sort((a, b) => a.order - b.order);
+            return { ...tc, steps };
+          }),
+        };
+      }),
+
     /** Removes a step and renumbers remaining steps by order. */
     deleteStep: (testCaseId, stepId) =>
       set((state) => ({
@@ -218,6 +249,15 @@ const store = create<ExecutionState & ExecutionActions>(
 
     /** Register/unregister executeStep (used by BrowserCanvas when stream connects). */
     setExecuteStep: (executeStep) => set({ executeStep }),
+
+    /** Append a page screenshot (called when bridge sends page_screenshot after nav). */
+    addPageScreenshot: (entry) =>
+      set((state) => ({
+        pageScreenshots: [...state.pageScreenshots, entry],
+      })),
+
+    /** Clear page screenshots (e.g. when a new run starts). */
+    clearPageScreenshots: () => set({ pageScreenshots: [] }),
 
     /** Resets the store to initial state (phase, test cases, logs, stream, etc.). */
     reset: () => set(defaultState),

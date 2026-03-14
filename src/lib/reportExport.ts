@@ -48,15 +48,28 @@ export function exportReportAsHtml(report: RunReport): string {
       const resolvedByBadge = resolvedByLabel
         ? '<span class="badge badge-resolved" title="Step resolved by ' + escapeHtml(resolvedByLabel) + '">' + escapeHtml(resolvedByLabel) + "</span>"
         : "";
+      const cacheHitLabel = step?.cacheHit ? '<span class="badge badge-cache">Cache Hit</span>' : "";
+      const aiHealLabel = step?.aiHeal ? '<span class="badge badge-aiheal">AI Heal</span>' : "";
       const discoveryDetail =
         step?.visualClick && step?.discoveryReason
           ? "<p class=\"discovery-detail\"><strong>Discovery:</strong> " + escapeHtml(step.discoveryReason) + (step?.validationPassed === true ? " · Validation passed" : step?.validationPassed === false ? " · Unverified" : "") + "</p>"
-          : "";
+          : step?.discoveryReason
+            ? "<p class=\"discovery-detail\"><strong>Reasoning:</strong> " + escapeHtml(step.discoveryReason) + "</p>"
+            : "";
       const expectedEl = step?.expectedElement ?? step?.instruction ?? "";
       const actualContent = step?.actualPageContent;
+      const failureTypeLabel =
+        isFailed && step?.failureType
+          ? "<p class=\"failure-type\"><strong>Failure type:</strong> " +
+            (step.failureType === "selector"
+              ? "Selector (element not found — fixable via AI heal)"
+              : "Functional (e.g. verify failed — possible product bug)") +
+            "</p>"
+          : "";
       const failureBlock =
         isFailed &&
-        "<p><strong>Expected element:</strong> " +
+        (failureTypeLabel +
+          "<p><strong>Expected element:</strong> " +
           escapeHtml(expectedEl || "—") +
           "</p><p><strong>Error:</strong> <span class=\"error\">" +
           escapeHtml(step?.error ?? "Step failed") +
@@ -66,7 +79,7 @@ export function exportReportAsHtml(report: RunReport): string {
               escapeHtml(actualContent.slice(0, 3000)) +
               (actualContent.length > 3000 ? "…" : "") +
               "</pre>"
-            : "");
+            : ""));
       const detailHtml =
         isFailed || hasScreenshot || discoveryDetail
           ? "<div class=\"step-detail\">" +
@@ -88,6 +101,8 @@ export function exportReportAsHtml(report: RunReport): string {
         selfHealedBadge +
         visualClickBadge +
         resolvedByBadge +
+        cacheHitLabel +
+        aiHealLabel +
         "<span class=\"step-num\">" +
         ((step?.order ?? 0) + 1) +
         ".</span>" +
@@ -133,6 +148,8 @@ export function exportReportAsHtml(report: RunReport): string {
     .badge-heal { background: rgba(139, 92, 246, 0.3); color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
     .badge-visual { background: rgba(34, 197, 94, 0.25); color: #4ade80; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
     .badge-resolved { background: rgba(100, 116, 139, 0.3); color: #94a3b8; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+    .badge-cache { background: rgba(20, 184, 166, 0.25); color: #2dd4bf; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+    .badge-aiheal { background: rgba(245, 158, 11, 0.25); color: #fbbf24; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
     .step-detail { padding: 12px; border-top: 1px solid #334155; background: #0f172a; font-size: 0.875rem; }
     .step-detail p { margin: 0 0 8px; }
     .step-detail .error { color: #f87171; }
