@@ -4,4 +4,4 @@ services:
     runtime: node
     plan: free
     buildCommand: npm install && npm run build
-    startCommand: npm run start
+    startCommand: npx playwright install chromium && npm run start
