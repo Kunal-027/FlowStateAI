@@ -6,6 +6,7 @@
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start",
+    "postinstall": "npx playwright install --with-deps",
     "lint": "next lint",
     "bridge": "node bridge/server.js",
     "bridge:watch": "nodemon --watch bridge --ext js bridge/server.js",
