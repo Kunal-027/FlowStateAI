@@ -31,7 +31,12 @@ function EditableStep({
   onDeleteStep: (testCaseId: string, stepId: string) => void;
   onStepBlur?: () => void;
   canDelete: boolean;
-}) {
+}) 
+
+{
+  const onStepBlur = () => {
+  };
+  
   const handleChange = (value: string) => {
     onUpdateStep(testCaseId, step.id, {
       instruction: value,
