@@ -3,5 +3,5 @@ services:
     name: flowstate-ai
     runtime: node
     plan: free
-    buildCommand: npm install && npx playwright install --with-deps && npm run build
+    buildCommand: npm install && npx playwright install chromium && npm run build
     startCommand: npm run start
