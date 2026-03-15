@@ -32,7 +32,7 @@ export interface TestStep {
   /** Human-readable instruction (e.g. "Click Submit") */
   instruction: string;
   /** Parsed Playwright-friendly command payload */
-  payload: PlaywrightStepPayload | null;
+  payload?: PlaywrightStepPayload
   status: StepStatus;
   /** 0-based execution order */
   order: number;
