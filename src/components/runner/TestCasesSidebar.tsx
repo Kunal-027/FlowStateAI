@@ -425,7 +425,7 @@ export function TestCasesSidebar({ className }: { className?: string }) {
       getStepDelayMs: () => getExecutionState().stepDelayMs,
       getWaitIfPaused,
       steps,
-      onRunComplete: (testCaseId) => {
+      onRunComplete: (testCaseId: string) => {
         const tc = getExecutionState().testCases.find((c) => c.id === testCaseId);
         if (tc && (tc.status === "success" || tc.status === "failed")) {
           useReportStore.getState().addReport(buildReportFromTestCase(tc));
