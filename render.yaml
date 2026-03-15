@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: flowstate-ai
+    runtime: node
+    plan: free
+    buildCommand: npm install && npx playwright install --with-deps && npm run build
+    startCommand: npm run start
