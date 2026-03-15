@@ -59,7 +59,7 @@ export function RunBar({ className }: { className?: string }) {
       id,
       {
         addLog: (entry) => store.addLog(entry),
-        updateTestCase: (tid, updates) => store.updateTestCase(tid, updates as Partial<TestCase>),
+        updateTestCase: (tid, updates) => store.updateTestCase(tid, updates as any),
         setActiveStep: store.setActiveStep,
         updateStep: store.updateStep,
       },
