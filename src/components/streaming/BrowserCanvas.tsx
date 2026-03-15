@@ -127,7 +127,12 @@ export function BrowserCanvas({ className }: BrowserCanvasProps) {
       const active = state.activeTestCaseId
         ? state.testCases.find((tc) => tc.id === state.activeTestCaseId)
         : null;
-      const startUrl = getStartUrlForTestCase(active?.steps);
+      const startUrl = getStartUrlForTestCase(
+        active?.steps?.map((s) => ({
+        instruction: s.instruction,
+        payload: s.payload ?? undefined,
+      }))
+);
       try {
         ws.send(JSON.stringify({ type: "RUN_TEST", url: startUrl }));
       } catch {
