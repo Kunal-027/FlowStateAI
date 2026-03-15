@@ -36,7 +36,7 @@ function EditableStep({
   const handleChange = (value: string) => {
     onUpdateStep(testCaseId, step.id, {
       instruction: value,
-      payload: parseSingleInstruction(value),
+      payload: parseSingleInstruction(value) ?? undefined,
     });
   };
 
